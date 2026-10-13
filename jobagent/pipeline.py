@@ -62,7 +62,7 @@ def _jobs_to_enrich(jobs: list[Job], profile: dict, now: datetime) -> list[Job]:
 
 
 def run(profile: dict, src_cfg: dict, pol: dict, paths: Paths, *, mode: str = "plan", browser: str = "local", limit: int = 25,
-        get=sources.http_get, llm: LLM | None = None, now: datetime | None = None, env: dict | None = None) -> Report:
+        get=sources.http_get, llm: LLM | None = None, judge: LLM | None = None, only: set[str] | None = None, now: datetime | None = None, env: dict | None = None) -> Report:
     """mode: plan (no browser, no tracker) | fill (browser fills forms, never submits) | live (submits auto-approved jobs)."""
     now, env, rep = now or datetime.now(timezone.utc), env or {}, Report()
     jobs, rep.errors = sources.fetch_all(src_cfg, get)
@@ -75,9 +75,13 @@ def run(profile: dict, src_cfg: dict, pol: dict, paths: Paths, *, mode: str = "p
             rep.errors.append(f"enrich {j.ats}:{j.board}/{j.ats_id} failed: {type(e).__name__}")
 
     survivors = []
+    s = profile["search"]
     for j in jobs:
         if reason := filters.hard_filter(j, profile, now):
             rep.dropped[reason.split(" at ")[0] if reason.startswith("pay tops") else reason] += 1
+        elif title_match(j.title, s.get("target_titles", [])) < s.get("min_title_match", 0.6):
+            # "Operations Manager" is half of "Marketing Operations Manager"; without this gate Product Managers and Data Scientists scored in
+            rep.dropped["title is not close to a target role"] += 1
         else:
             survivors.append(j)
 
@@ -86,7 +90,7 @@ def run(profile: dict, src_cfg: dict, pol: dict, paths: Paths, *, mode: str = "p
 
     scored = sorted(((score(j, profile, now), j) for j in survivors), key=lambda x: -x[0].total)
     rep.scored = len(scored)
-    shortlist = [(s, j) for s, j in scored if s.total >= pol["ask_min_score"]][:limit]
+    shortlist = [(s, j) for s, j in scored if s.total >= pol["ask_min_score"] and (not only or j.id in only)][:limit]
 
     resume = PROJECT / profile.get("resume_file", "resume.pdf")  # relative to the repo; an absolute path also works
     page_cm = None
@@ -95,7 +99,7 @@ def run(profile: dict, src_cfg: dict, pol: dict, paths: Paths, *, mode: str = "p
             page_cm = ap.open_page(browser, env)
             page = page_cm.__enter__()
         for sc, j in shortlist:
-            packet = tailor(j, profile, sc, llm)
+            packet = tailor(j, profile, sc, llm, judge)
             plan = _form_plan(j, profile, get, rep)
             dec = decide(j, sc, packet, plan, pol, paths.ledger, paths.stop)
             item = Item(j, sc, packet, plan, dec)

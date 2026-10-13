@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from urllib.parse import urlsplit
@@ -72,9 +73,25 @@ COUNTRY_ALIASES = {
 }
 
 
+# Big non-US hubs by name. A city alone is only believed when it is not followed by a US state code ("Dublin, OH", "London, KY", "Berlin, CT").
+CITIES = {
+    "germany": "berlin|munich|hamburg|frankfurt|cologne", "united kingdom": "london|manchester|edinburgh|bristol|glasgow",
+    "canada": "toronto|vancouver|montreal|ottawa|calgary|waterloo", "ireland": "dublin|cork", "india": "bangalore|bengaluru|mumbai|delhi|hyderabad|pune|chennai|gurgaon|gurugram|noida",
+    "australia": "sydney|melbourne|brisbane|perth", "brazil": "sao paulo|rio de janeiro|brasil", "france": "paris|lyon", "spain": "madrid|barcelona",
+    "netherlands": "amsterdam|rotterdam", "poland": "warsaw|krakow|wroclaw", "portugal": "lisbon|porto", "israel": "tel aviv|jerusalem", "japan": "tokyo|osaka",
+    "mexico": "mexico city|guadalajara|monterrey", "argentina": "buenos aires", "colombia": "bogota|medellin", "philippines": "manila", "singapore": "singapore",
+}
+US_STATE_CODE = r"(?:A[LKZR]|C[AOT]|DE|FL|GA|HI|I[ADLN]|K[SY]|LA|M[ADEINOST]|N[CDEHJMVY]|O[HKR]|PA|RI|S[CD]|T[NX]|UT|V[AT]|W[AIVY]|DC)"
+
+
 def countries_in(text: str) -> set[str]:
-    t = (text or "").lower()
-    return {c for c, rx in COUNTRY_ALIASES.items() if re.search(rx, t)}
+    raw = unicodedata.normalize("NFKD", text or "").encode("ascii", "ignore").decode()   # "São Paulo" -> "Sao Paulo"
+    t = raw.lower()
+    found = {c for c, rx in COUNTRY_ALIASES.items() if re.search(rx, t)}
+    for country, cities in CITIES.items():
+        if re.search(rf"(?i:\b(?:{cities})\b)(?!,?\s+{US_STATE_CODE}\b)", raw):   # state codes are matched upper-case only: "Toronto or ..." is not Oregon
+            found.add(country)
+    return found
 
 
 def _remote(job: Job) -> bool:
@@ -112,6 +129,12 @@ def visa_reason(job: Job, cfg: dict) -> str | None:
     return None
 
 
+def excluded(company: str, banned: str) -> bool:
+    """'Acme Corp' also bans 'Acme Corp, Inc.' and 'Acme Corp Consulting': the banned name as whole words at the start of the company."""
+    c, b = f" {norm(company)} ", norm(banned)
+    return bool(b) and c.startswith(f" {b} ")
+
+
 # --- the filter chain -------------------------------------------------------
 
 
@@ -124,7 +147,7 @@ def hard_filter(job: Job, profile: dict, now: datetime | None = None) -> str | N
             return "no posted date"
     elif now - job.posted > timedelta(days=s.get("max_age_days", 7)):
         return f"older than {s.get('max_age_days', 7)} days"
-    if any(norm(c) == norm(job.company) for c in s.get("exclude_companies", [])):
+    if any(excluded(job.company, c) for c in s.get("exclude_companies", [])):
         return "excluded company"
     title = job.title.lower()
     if bad := next((w for w in s.get("exclude_title_words", []) if re.search(rf"\b{re.escape(w.lower())}\b", title)), None):

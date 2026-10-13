@@ -22,7 +22,10 @@ Nothing in this repo is personal. Your details live in `profile.yaml`, which is 
    every point can be explained (title match, skills, level, location, pay, freshness).
 5. **Writes tailored bullets and a short cover note** from your own profile only.
 6. **Checks the writing with a separate judge** (`claimcheck`): every number, tool name, employer and credential
-   must exist in your profile. Anything else is flagged and the job is never auto-applied.
+   must exist in your profile, and each number must sit next to the same words it sits next to in one profile line
+   (so "91% organic growth" fails when 91% was a different result). It also flags spelled-out numbers, "doubled",
+   "a team of", lower-case tool names and "At <company>" lines for a company that is not an employer or a named client.
+   Anything flagged is never auto-applied.
 7. **Reads the application form before opening a browser** and works out what it can truthfully answer.
 8. **Applies through a policy gate** (below). Dropdown and text answers come from your profile.
 9. **Tracks everything** in a CSV, prints a daily digest, and reports your real conversion numbers.
@@ -42,12 +45,15 @@ cp .env.example .env                          # only needed for --live and model
    here, so a thin profile means thin applications. Tag each bullet with the skills it proves. Put your resume PDF
    next to it and set `resume_file`.
 2. **Pick your boards in `sources.yaml`.** Take the slug from a company's jobs URL
-   (`boards.greenhouse.io/<slug>`, `jobs.lever.co/<slug>`, `jobs.ashbyhq.com/<slug>`). Twenty to fifty smaller
+   (`boards.greenhouse.io/<slug>`, `jobs.lever.co/<slug>`, `jobs.ashbyhq.com/<slug>`). Lever and Ashby only give the slug, so add
+   `names: {slug: Real Company Name}` for the ones you care about; otherwise the cover note says "Hi Wpromote team". Twenty to fifty smaller
    companies in your field beats the famous ten.
 3. **Try it without risk:** `python -m jobagent run`. It plans only: no browser, no applications, nothing recorded.
    Read `out/<today>/report.md` and the packets in `out/<today>/packets/`.
 4. **Watch a form get filled, still without submitting:** `python -m jobagent run --fill`. A local browser fills
-   every eligible form and takes a screenshot. It never presses Submit.
+   every eligible form and takes a screenshot. It never presses Submit. To preview any one job from a plan run,
+   including Ashby ones and ones waiting for your OK: `python -m jobagent fill <id>` (the id is in `report.md`).
+   It lists every required field it could not answer from your profile.
 5. **Go live when you trust it:** add Browserbase keys to `.env` (see costs), then `python -m jobagent run --live`.
 
 ## The gate: when it applies by itself, and when it asks you
@@ -102,7 +108,7 @@ titles, not the volume. Change those before sending more.
   at the time of writing. Check browserbase.com/pricing. You only need it for `--live` and `login`; `run` and
   `run --fill` use free local Chromium.
 - **Model API** (optional, for rewording): without a key the agent reuses your bullets word for word, which is
-  free and cannot invent anything. With a key (`LLM_API_KEY`, any OpenAI-compatible API such as OpenRouter) a
+  free and cannot invent anything. With a key (`LLM_API_KEY`, any OpenAI-compatible API such as OpenRouter; for a model that thinks before answering, also set `LLM_MAX_TOKENS=12000`) a
   tailored application costs roughly a cent or two (an estimate; it depends on the model). A reworded draft that
   fails the claim check is rejected and the word-for-word version is used instead.
 - **Bitwarden:** free tier works. 1Password is supported too.
@@ -111,9 +117,14 @@ titles, not the volume. Change those before sending more.
 
 - **Indeed and LinkedIn are not automated.** They need logins and captchas and restrict automation. Use the
   review list for those.
-- Only Greenhouse and Lever are auto-submitted. Ashby, Workable, HN and RSS jobs become packets for you.
-- The claim check is deliberately strict. It checks numbers, capitalised names and tools, and credential words.
-  It cannot judge whether a true fact is framed well; read the cover note before you approve anything.
+- Only Greenhouse and Lever are auto-submitted. Ashby forms are filled and screenshotted (`fill <id>`) but submitting them is
+  refused until someone proves it. Workable, HN and RSS jobs become packets for you. Workable rate-limits hard: keep that list short.
+- Consent questions (SMS, privacy) and free-text essays are never answered for you. They show up as "required fields still empty".
+- The claim check is deliberately strict. It checks numbers (in context, and "more than 10" is not "10+"), names, tools, credential words,
+  size words and employer attributions. In a mutation test of 22 deliberate lies the regex checks caught 20; the two it missed were plain prose
+  with no number or capital ("I won agency of the year", "I think in funnels"). Set `JUDGE_MODEL` in `.env` (a different model from `LLM_MODEL`)
+  and a second model reads each model-written draft against your profile and rejects anything unsupported or stretched; it caught both. Plain-prose claims need that second judge, or your own read.
+  Neither can tell whether a true fact is framed well. Read the cover note before you approve anything.
 - Location and visa rules are keyword rules, not legal advice. Pay is parsed in USD only; jobs that state no pay
   are kept unless you set `require_salary: true`.
 - Greenhouse's city autocomplete and employer-specific custom questions are the usual reasons a form falls back to

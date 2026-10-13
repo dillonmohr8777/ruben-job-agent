@@ -15,7 +15,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .forms import EEO, FormPlan
+from .forms import ANSWER_RULES, EEO, FormPlan, answers, pick_option
 from .models import Job
 
 BB_API = "https://api.browserbase.com/v1"
@@ -153,8 +153,11 @@ JS_UNFILLED = """() => [...document.querySelectorAll('input,textarea,select')].f
   const box = e.closest('[class*="select__control"]');  // react-select keeps its value in a styled div, not the input
   if (box && box.querySelector('[class*="single-value"],[class*="multi-value"]')) return false;
   if (e.type === 'file') return e.files.length === 0;
+  if (e.type === 'radio') return ![...document.querySelectorAll('input[type=radio]')].some(r => r.name === e.name && r.checked);   // a radio's value is never empty; its group is what must be answered
   return !(e.value || '').trim();
 }).map(e => {
+  const q = e.type === 'radio' && ((e.closest('.application-field') || {}).parentElement || e.closest('fieldset') || e.closest('.application-question') || e.closest('li'));   // name the question, not the option ("Yes")
+  if (q) return ((q.querySelector('.application-label, legend') || q).innerText.split('\\n')[0] + '').trim().slice(0, 90);
   const l = (e.id && document.querySelector(`label[for="${e.id}"]`)) || e.closest('label') || e.closest('fieldset,.field,.application-question,li,div');
   return ((e.getAttribute('aria-label') || (l && l.innerText) || e.name || e.id || e.type) + '').trim().slice(0, 90);
 })"""
@@ -200,6 +203,29 @@ LEVER_FIELDS = {"name": "name", "email": "email", "phone": "phone", "org": "org"
                 "linkedin": "urls[LinkedIn]", "website": "urls[Portfolio]"}
 
 
+JS_RADIO_GROUPS = """() => {
+  const g = {};
+  for (const r of document.querySelectorAll('input[type=radio]')) (g[r.name] = g[r.name] || []).push(r);
+  return Object.entries(g).map(([name, rs]) => {
+    const box = (rs[0].closest('.application-field') || {}).parentElement || rs[0].closest('fieldset') || rs[0].closest('.application-question') || rs[0].closest('li');
+    const q = (box.querySelector('.application-label, legend') || box).innerText.split('\\n')[0].trim();
+    return {name, q, opts: rs.map(r => ((r.labels && r.labels[0]) || r.parentElement).innerText.trim())};
+  });
+}"""
+
+
+def _answer_radio_groups(page, profile: dict) -> None:
+    """Yes/No and choice questions (work authorization, sponsorship, how did you hear). Answered only when a profile answer matches an option."""
+    a = answers(profile)
+    for g in page.evaluate(JS_RADIO_GROUPS):
+        if EEO.search(g["q"]):
+            continue
+        key = next((k for rx, k in ANSWER_RULES if re.search(rx, g["q"], re.I)), None)
+        pick = pick_option(a.get(key or "", []), g["opts"])
+        if pick is not None:
+            page.locator(f'input[type=radio][name="{g["name"]}"]').nth(g["opts"].index(pick)).evaluate("r => ((r.labels && r.labels[0]) || r).click()")
+
+
 def _fill_lever(page, plan: FormPlan, profile: dict, resume: Path, note: str) -> None:
     by = {f.name: f.value for f in plan.fills}
     full = " ".join(x for x in (by.get("first_name"), by.get("last_name")) if x)
@@ -228,12 +254,97 @@ def _fill_lever(page, plan: FormPlan, profile: dict, resume: Path, note: str) ->
     page.set_input_files('input[name="resume"]', str(resume))
     if el := page.query_selector('textarea[name="comments"]'):
         el.fill(note)
+    _answer_radio_groups(page, profile)
+
+
+JS_ASHBY_TEXT = """([label, value]) => {
+  const rx = new RegExp(label, 'i');
+  for (const e of document.querySelectorAll('input[type=text],input[type=tel],input[type=url],textarea')) {
+    if (e.value) continue;
+    const l = (e.id && document.querySelector(`label[for="${e.id}"]`)) || e.closest('label') || e.closest('div[class*="field"],fieldset,div');
+    if (l && rx.test(l.innerText.split('\\n')[0])) {
+      const set = Object.getOwnPropertyDescriptor(e.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype, 'value').set;
+      set.call(e, value); e.dispatchEvent(new Event('input', {bubbles: true})); e.dispatchEvent(new Event('change', {bubbles: true}));
+      return true;
+    }
+  }
+  return false;
+}"""
+
+
+def _fill_ashby(page, plan: FormPlan, profile: dict, resume: Path, note: str) -> None:
+    """Ashby forms are plain React inputs with stable ids for name, email and resume; everything else is a custom question,
+    answered only when its label is one we have a profile fact for. The rest is reported as unfilled, never guessed."""
+    by = {f.name: f.value for f in plan.fills}
+    c = profile.get("contact", {})
+    page.fill("#_systemfield_name", " ".join(x for x in (by.get("first_name"), by.get("last_name")) if x))
+    page.fill("#_systemfield_email", by.get("email", ""))
+    page.set_input_files("#_systemfield_resume", str(resume))
+    for label, value in (("linkedin", c.get("linkedin")), ("phone", c.get("phone")), ("website|portfolio", c.get("website")),
+                         ("cover letter|additional information|anything else", note)):
+        if value:
+            page.evaluate(JS_ASHBY_TEXT, [label, value])
+    _ashby_yes_no_and_location(page, profile)
+    try:
+        page.get_by_text(resume.name).first.wait_for(timeout=15000)  # the uploaded file name appearing is the proof it attached
+    except Exception:  # noqa: BLE001
+        pass
+
+
+JS_ASHBY_UNFILLED = """() => [...document.querySelectorAll('[class*="_fieldEntry_"]')].filter(e => {
+  const lab = e.querySelector('label');
+  if (!lab || !/_required_/.test(lab.className)) return false;
+  if (e.querySelector('.ashby-application-form-input-yesno')) return !e.querySelector('[aria-pressed=true]');   // a 'No' leaves the hidden checkbox unchecked
+  const boxes = [...e.querySelectorAll('input[type=checkbox],input[type=radio]')];
+  if (boxes.length) return !boxes.some(b => b.checked);
+  const f = e.querySelector('input[type=file]');
+  if (f) return f.files.length === 0 && !/\\.(pdf|docx?|txt)/i.test(e.innerText);
+  const t = e.querySelector('input,textarea');
+  return !(t && t.value.trim());
+}).map(e => e.querySelector('label').innerText.trim().slice(0, 90))"""
+
+
+def _ashby_yes_no_and_location(page, profile: dict) -> None:
+    """Yes/No buttons answered only from profile.answers (work authorization etc.); EEO never; the city autocomplete only by clicking a real suggestion."""
+    a = answers(profile)
+    entries = page.locator('[class*="_fieldEntry_"]')
+    for i in range(entries.count()):
+        e = entries.nth(i)
+        label = e.locator("label").first.inner_text()
+        if EEO.search(label):
+            continue
+        yes, no = e.get_by_role("button", name="Yes", exact=True), e.get_by_role("button", name="No", exact=True)
+        key = next((k for rx, k in ANSWER_RULES if re.search(rx, label, re.I)), None)
+        wanted = a.get(key or "") or [""]
+        want = wanted[0]
+        radios = e.locator("input[type=radio]")
+        if radios.count() and wanted[0]:
+            opts = [radios.nth(j).evaluate("r => ((r.labels && r.labels[0]) || r.parentElement).innerText.trim()") for j in range(radios.count())]
+            if (pick := pick_option(wanted, opts)) is not None:   # only an option that matches a profile answer; consents and the rest stay unanswered
+                radios.nth(opts.index(pick)).evaluate("r => ((r.labels && r.labels[0]) || r).click()")
+            continue
+        if yes.count() and no.count() and want in ("Yes", "No"):
+            (yes if want == "Yes" else no).first.click()
+        elif (box := e.locator("input[type=text],input[type=tel]")).count() and want and key in ("phone", "how_did_you_hear", "linkedin", "website") and not box.first.input_value():
+            box.first.fill(want)
+        elif re.fullmatch(r"\s*location\s*\*?\s*", label, re.I) and (loc := (profile.get("contact") or {}).get("location")):
+            box = e.get_by_role("combobox")
+            box.click()
+            page.keyboard.type(loc.split(",")[0], delay=50)
+            try:
+                opt = page.get_by_role("option").filter(has_text=re.compile(rf"^{re.escape(loc.split(',')[0])}", re.I)).first
+                opt.wait_for(timeout=6000)
+                opt.click()
+            except Exception:  # noqa: BLE001 - leave it empty and let the unfilled check report it
+                page.keyboard.press("Escape")
 
 
 def apply_job(page, job: Job, profile: dict, plan: FormPlan, cover_note: str, resume: Path, shots: Path, submit: bool = False) -> ApplyResult:
     """submit=False fills and screenshots only. submit=True also presses Submit and requires the confirmation page."""
-    if job.ats not in ("greenhouse", "lever"):
+    if job.ats not in ("greenhouse", "lever", "ashby"):
         raise ApplyError(f"{job.ats} is not an auto-apply form")
+    if job.ats == "ashby" and submit:
+        raise ApplyError("Ashby forms can be filled and screenshotted, but submitting them is not verified yet")
     resume = Path(resume)
     if not resume.exists():
         raise ApplyError(f"resume not found: {resume}")
@@ -243,15 +354,19 @@ def apply_job(page, job: Job, profile: dict, plan: FormPlan, cover_note: str, re
     note_file = note_dir / f"{(profile.get('name') or 'Applicant').replace(' ', '-')}-cover-note.txt"
     note_file.write_text(cover_note)
     # Greenhouse boards on a company's own domain (stripe.com/jobs/...) all have this hosted form too.
-    url = (f"https://job-boards.greenhouse.io/{job.board}/jobs/{job.ats_id}" if job.ats == "greenhouse"
-           else f"https://jobs.lever.co/{job.board}/{job.ats_id}/apply")
+    url = {# the embed form is the same hosted form, and it also works for boards whose job page lives on the company's own site (acme.com)
+           "greenhouse": f"https://job-boards.greenhouse.io/embed/job_app?for={job.board}&token={job.ats_id}",
+           "lever": f"https://jobs.lever.co/{job.board}/{job.ats_id}/apply",
+           "ashby": f"https://jobs.ashbyhq.com/{job.board}/{job.ats_id}/application"}[job.ats]
     page.goto(url, wait_until="networkidle", timeout=60000)
     if job.ats == "greenhouse":
         _fill_greenhouse(page, plan, profile, resume, note_file)
-    else:
+    elif job.ats == "lever":
         _fill_lever(page, plan, profile, resume, cover_note)
+    else:
+        _fill_ashby(page, plan, profile, resume, cover_note)
     out = ApplyResult("DRY_RUN", [_shot(page, shots, f"{job.id}-filled")])
-    out.unfilled = unfilled_required(page)
+    out.unfilled = sorted(set(page.evaluate(JS_ASHBY_UNFILLED))) if job.ats == "ashby" else unfilled_required(page)
     if out.unfilled:
         out.note = "required fields still empty: " + "; ".join(out.unfilled[:5])
         if any(EEO.search(x) for x in out.unfilled):

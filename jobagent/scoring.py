@@ -35,7 +35,7 @@ def find_skills(text: str, terms: dict[str, list[str]]) -> list[str]:
     return [k for k, names in terms.items() if any(re.search(rf"(?<![a-z0-9]){re.escape(n.lower())}(?![a-z0-9])", text.lower()) for n in names)]
 
 
-GENERIC = {"manager", "senior", "sr", "lead", "staff", "principal", "specialist", "associate", "ii", "iii", "head", "of", "and", "the", "global", "remote"}
+GENERIC = {"manager", "senior", "sr", "lead", "staff", "principal", "specialist", "associate", "ii", "iii", "head", "director", "vp", "chief", "of", "and", "the", "global", "remote"}
 
 
 def title_match(title: str, targets: list[str]) -> float:
@@ -49,6 +49,22 @@ def title_match(title: str, targets: list[str]) -> float:
         if key:
             best = max(best, len(key & tw) / len(key))
     return best
+
+
+YEARS = re.compile(r"(\d{1,2})\+?\s*(?:-\s*\d{1,2}\s*)?(?:or more\s+)?years?\s+(?:of\s+)?(?:(?:\w+[ ,/&-]+){0,6}?experience|(?:in|as|working|managing|running)\b)", re.I)
+
+
+def years_of_experience(profile: dict, now: datetime) -> float:
+    """From the earliest start date in the profile to now. A stated number would be a claim; this is arithmetic on dates you gave."""
+    starts = [str(e.get("start", "")) for e in profile.get("experience", []) if re.match(r"\d{4}", str(e.get("start", "")))]
+    if not starts:
+        return 99.0  # no dates, no penalty
+    y, _, m = min(starts).partition("-")
+    return (now.year - int(y)) + (now.month - int(m or 1)) / 12
+
+
+def years_required(text: str) -> int:
+    return max((int(m.group(1)) for m in YEARS.finditer(text) if 2 <= int(m.group(1)) <= 20), default=0)
 
 
 def score(job: Job, profile: dict, now: datetime | None = None) -> Score:
@@ -90,5 +106,9 @@ def score(job: Job, profile: dict, now: datetime | None = None) -> Score:
     if flags:
         notes.append(f"red flags: {', '.join(flags)}")
 
+    need, have = years_required(job.description), years_of_experience(profile, now)
+    if need and need >= have + 2:   # "6+ years" for someone with 4 is a stretch the title match cannot see
+        penalty += 10
+        notes.append(f"asks {need}+ years of experience; the profile's dates show about {have:.0f}")
     total = max(0, round(sum(parts.values()) - penalty))
     return Score(total, {k: round(v, 1) for k, v in parts.items()}, hit, notes)

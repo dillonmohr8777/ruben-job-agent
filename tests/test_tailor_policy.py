@@ -46,6 +46,14 @@ def test_unparseable_model_reply_falls_back(profile):
     assert p.mode == "model-rejected-fell-back" and p.claims.ok
 
 
+def test_fallback_claim_check_sees_bullets_and_note_as_separate_lines(profile):
+    for e in profile["experience"]:
+        for b in e["bullets"]:
+            b["text"] = b["text"].rstrip(".") + " and lowered CPA."          # a bullet ending in an acronym used to fuse with "Hi <company> team"
+    _, _, p = _packet(profile, llm=lambda s, u: "sure! here you go")
+    assert p.mode == "model-rejected-fell-back" and p.claims.ok, str(p.claims)
+
+
 # --- policy ---------------------------------------------------------------------
 
 
@@ -93,3 +101,37 @@ def test_company_cooldown(profile, pol, tmp_path):
     # ledger timestamps are 'now' (real clock); decide() compares to the injected NOW, so a record from the real
     # clock is in the future of NOW. Cooldown must still trigger.
     assert d.verdict == "ask" and "already applied" in d.reason
+
+
+def test_company_name_from_a_slug_is_not_retitled(profile):
+    from jobagent.tailor import _company
+    from conftest import make_job
+    assert _company(make_job(company="829studios")) == "829studios" and _company(make_job(company="wpromote")) == "Wpromote"
+    assert _company(make_job(company="PostHog")) == "PostHog"
+
+
+def test_empty_model_reply_gives_a_readable_error(monkeypatch):
+    import io, json, pytest
+    from jobagent import llm
+
+    class R(io.BytesIO):
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+
+    monkeypatch.setattr(llm.urllib.request, "urlopen", lambda req, timeout=0: R(json.dumps({"choices": [{"message": {"content": None}, "finish_reason": "length"}]}).encode()))
+    with pytest.raises(ValueError, match="no text.*LLM_MAX_TOKENS"):
+        llm.from_env({"LLM_API_KEY": "x"})("sys", "user")
+
+
+def test_model_draft_that_a_second_judge_rejects_falls_back(profile):
+    import json
+    good = json.dumps({"bullets": [profile["experience"][0]["bullets"][0]["text"]] * 5, "cover_note": "Hi Acme team, I run paid media. Alex Sample"})
+    judge = lambda s, u: json.dumps({"claims": [{"claim": "I think in funnels", "support": None, "verdict": "unsupported"}]})
+    job, sc, _ = _packet(profile)
+    p = tailor.tailor(job, profile, sc, llm=lambda s, u: good, judge=judge)
+    assert p.mode == "model-rejected-fell-back" and p.claims.ok
+    ok_judge = lambda s, u: json.dumps({"claims": [{"claim": "x", "support": "y", "verdict": "stretched"}]})
+    p2 = tailor.tailor(job, profile, sc, llm=lambda s, u: good, judge=ok_judge)
+    assert p2.mode == "model-rejected-fell-back"          # a stretch is rejected too; only a clean verdict passes
+    clean = lambda s, u: json.dumps({"claims": [{"claim": "x", "support": "y", "verdict": "supported"}]})
+    assert tailor.tailor(job, profile, sc, llm=lambda s, u: good, judge=clean).mode == "model"

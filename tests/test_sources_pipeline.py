@@ -97,3 +97,47 @@ def test_live_mode_records_ledger_and_tracker_and_never_repeats(profile, pol, tm
     assert [r["status"] for r in led].count("VERIFIED") == 1
     pipeline.run(profile, CFG, pol, paths, mode="live", get=fake_get, now=NOW)       # same day, same jobs
     assert len(submitted) == 1                                                       # already in the tracker: never applied twice
+
+
+def test_workable_pages_are_all_read():
+    pages = {None: {"results": [{"title": "SEO Manager", "shortcode": "A1", "published": "2026-10-12"}], "nextPage": "p2", "total": 2},
+             "p2": {"results": [{"title": "Paid Media Manager", "shortcode": "B2", "published": "2026-10-12"}], "total": 2}}
+    jobs = sources.workable("acme", lambda url, data=None, **kw: pages[(data or {}).get("token")])
+    assert [j.ats_id for j in jobs] == ["A1", "B2"]   # before the fix only the first page (10 jobs) was ever seen
+
+
+def test_names_map_replaces_url_slug_company():
+    jobs, _ = sources.fetch_all({"lever": ["zed"], "names": {"zed": "Zed Corp"}}, fake_get)
+    assert jobs[0].company == "Zed Corp"        # Lever's API only knows the slug; the cover note and exclude list need the real name
+
+
+def test_rate_limited_board_is_retried_before_it_is_called_dead(monkeypatch):
+    import io, urllib.error
+    calls = []
+
+    class R(io.BytesIO):
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+
+    def fake_open(req, timeout=0):
+        calls.append(1)
+        if len(calls) < 3:
+            raise urllib.error.HTTPError(req.full_url, 429, "Too Many Requests", {"Retry-After": "0"}, None)
+        return R(b'{"ok": 1}')
+
+    monkeypatch.setattr(sources.urllib.request, "urlopen", fake_open)
+    assert sources.http_get("https://x.example/api") == {"ok": 1} and len(calls) == 3
+
+
+def test_half_title_matches_are_dropped_before_scoring(profile, pol, tmp_path):
+    pm = {"jobs": [{**GH_LIST["jobs"][0], "id": 99, "title": "Senior Product Manager, Growth", "absolute_url": "https://boards.greenhouse.io/acme/jobs/99"}]}
+    get = lambda url, data=None, text=False, timeout=30: pm if ("boards-api" in url and "questions" not in url) else fake_get(url, data, text, timeout)
+    rep = pipeline.run(profile, {"greenhouse": ["acme"]}, pol, pipeline.Paths(tmp_path, "2026-10-13"), mode="plan", get=get, now=NOW)
+    assert rep.items == [] and rep.dropped["title is not close to a target role"] == 1
+
+
+def test_only_redoes_the_named_jobs(profile, pol, tmp_path):
+    every = pipeline.run(profile, CFG, pol, pipeline.Paths(tmp_path / "a", "2026-10-13"), mode="plan", get=fake_get, now=NOW)
+    one = every.items[0].job.id
+    rep = pipeline.run(profile, CFG, pol, pipeline.Paths(tmp_path / "b", "2026-10-13"), mode="plan", get=fake_get, only={one}, now=NOW)
+    assert [i.job.id for i in rep.items] == [one] and len(every.items) > 1

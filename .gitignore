@@ -10,3 +10,4 @@ data/
 out/
 STOP
 demo-profile.local.yaml
+*.local.yaml

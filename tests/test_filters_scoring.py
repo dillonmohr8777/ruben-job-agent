@@ -85,3 +85,36 @@ def test_red_flag_penalty(profile):
     clean = scoring.score(make_job(), profile, NOW).total
     flagged = scoring.score(make_job(description=make_job().description + " Commission only."), profile, NOW)
     assert flagged.total == clean - 15 and "red flags" in flagged.notes[-1]
+
+
+def test_excluded_company_matches_legal_name_variants_but_not_lookalikes():
+    from jobagent.filters import excluded
+    assert excluded("Acme Corp, Inc.", "Acme Corp") and excluded("Globex 360", "globex 360")
+    assert not excluded("Acmeville", "Acme") and not excluded("Pre-Globex", "Globex")   # whole words only
+
+
+def test_foreign_cities_count_as_foreign_but_us_namesakes_do_not():
+    from jobagent.filters import countries_in
+    assert countries_in("Berlin") == {"germany"} and countries_in("Avenida das Nações Unidas, 12901 São Paulo") == {"brazil"}
+    assert countries_in("Dublin, OH") == set() and countries_in("London, KY") == set()          # US towns
+    assert countries_in("Remote - Toronto or United States") == {"canada", "united states"}   # an explicit US option keeps it eligible
+
+
+def test_preferred_first_name_question_is_answerable(profile):
+    from jobagent import forms
+    q = {"compliance": [], "demographic_questions": [], "questions": [
+        {"label": "What is your preferred first name? If your legal first name and preferred first name are the same, enter it again", "required": True,
+         "fields": [{"name": "question_1", "type": "input_text"}]}]}
+    plan = forms.plan_greenhouse(q, profile)
+    assert plan.blockers == [] and plan.fills[0].value == "Alex"
+
+
+def test_years_of_experience_requirement_is_a_penalty_not_a_surprise(profile):
+    from jobagent.scoring import score, years_required, years_of_experience
+    from conftest import make_job
+    assert years_required("6+ years of B2B demand generation experience") == 6 and years_required("8 years of experience in program management") == 8
+    assert years_required("4 week sabbatical after 5 years of continuous full time employment") == 0
+    assert 6 < years_of_experience(profile, NOW) < 8                                            # sample profile starts 2019-06
+    base = score(make_job(), profile, NOW)
+    stretch = score(make_job(description=make_job().description + " Requires 12+ years of experience."), profile, NOW)
+    assert stretch.total == base.total - 10 and any("12+ years" in n for n in stretch.notes)

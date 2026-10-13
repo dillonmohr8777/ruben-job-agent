@@ -27,6 +27,7 @@ skills:
   - {name: Content marketing, aliases: [content strategy]}
 
 # Real experience, most recent first. Each bullet is a fact you can defend in an interview.
+# Put quotes around any bullet that contains a # or a : ("Reached #1 ..."). Unquoted, YAML silently cuts the bullet at the #; the agent warns when a bullet looks cut off.
 # Tag skills per bullet so the matcher can pick the right ones for each job.
 experience:
   - employer: Northwind Software
@@ -96,5 +97,6 @@ search:
   visa:
     needs_sponsorship: false
     us_citizen: false
+  min_title_match: 0.6                    # a job title must share this much of a target title (0.6 = most of its distinctive words)
   max_age_days: 7
   allow_undated: false

@@ -12,7 +12,7 @@ from pathlib import Path
 import yaml
 
 from . import apply as ap
-from . import ledger, llm, tracker
+from . import claimcheck, ledger, llm, tracker
 from .filters import canon_url  # noqa: F401
 from .forms import FormPlan, Fill
 from .models import Job
@@ -47,10 +47,14 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--live", action="store_true", help="submit auto-eligible applications (browserbase unless --browser local)")
     r.add_argument("--browser", choices=["local", "browserbase"])
     r.add_argument("--limit", type=int, default=25)
+    r.add_argument("--only", help="comma-separated job ids: redo just these (a model call per job is the slow, paid part)")
     a = sub.add_parser("approve", help="submit one job from the review queue after you read its packet")
     a.add_argument("job_id")
     a.add_argument("--browser", choices=["local", "browserbase"], default="browserbase")
     a.add_argument("--dry", action="store_true", help="fill and screenshot only")
+    f = sub.add_parser("fill", help="open one queued job's real form in a local browser, fill it, screenshot it, and stop. Never submits.")
+    f.add_argument("job_id")
+    f.add_argument("--browser", choices=["local", "browserbase"], default="local")
     t = sub.add_parser("track", help="update a tracked job: track <id> <status> [--name --email --follow-up --note]")
     t.add_argument("job_id")
     t.add_argument("status", choices=tracker.STATUSES)
@@ -71,14 +75,20 @@ def main(argv: list[str] | None = None) -> int:
         if not prof.exists():
             print(f"{args.profile} not found. Copy profile.example.yaml to profile.yaml and fill it in.", file=sys.stderr)
             return 2
+        profile = _yaml(prof)
+        for w in claimcheck.profile_warnings(profile):
+            print("profile warning:", w, file=sys.stderr)
         mode = "live" if args.live else "fill" if args.fill else "plan"
         browser = args.browser or ("browserbase" if args.live else "local")
-        rep = run(_yaml(prof), _yaml(ROOT / args.sources), _yaml(ROOT / args.policy), paths, mode=mode, browser=browser, limit=args.limit,
-                  llm=llm.from_env(env), env=env)
+        rep = run(profile, _yaml(ROOT / args.sources), _yaml(ROOT / args.policy), paths, mode=mode, browser=browser, limit=args.limit,
+                  llm=llm.from_env(env), judge=llm.from_env(env, 'JUDGE_MODEL') if env.get('JUDGE_MODEL') else None,
+                  only=set(args.only.split(',')) if args.only else None, env=env)
         print((paths.out / "report.md").read_text())
         return 0
     if args.cmd == "approve":
         return approve(args, paths, env)
+    if args.cmd == "fill":
+        return fill(args, paths, env)
     if args.cmd == "track":
         kw = {k: v for k, v in vars(args).items() if k in ("recruiter_name", "recruiter_email", "follow_up_on", "notes") and v}
         print(tracker.set_status(paths.tracker, args.job_id, args.status, **kw))
@@ -104,6 +114,29 @@ def main(argv: list[str] | None = None) -> int:
         print("BROWSERBASE_CONTEXT_ID=" + ap.create_context(env))
         return 0
     return 1
+
+
+def latest_packet(paths: Paths, job_id: str) -> Path | None:
+    found = sorted((paths.root / "out").glob(f"*/packets/{job_id}.json"))
+    return found[-1] if found else None
+
+
+def fill(args, paths: Paths, env: dict) -> int:
+    """Dry run for any packet from any run: Greenhouse, Lever or Ashby. Reads out/<day>/packets/<id>.json, so it works for
+    jobs the gate sent to `ask` too. It cannot submit: apply_job is called with submit=False and nothing is recorded."""
+    pk = latest_packet(paths, args.job_id)
+    if not pk:
+        print("no packet with that id under out/*/packets; run `run` first", file=sys.stderr)
+        return 2
+    d = json.loads(pk.read_text())
+    job = Job(**{**d["job"], "posted": None})
+    plan = FormPlan(fills=[Fill(**f) for f in d["plan"]["fills"]], blockers=d["plan"]["blockers"])
+    profile = _yaml(ROOT / "profile.yaml")
+    with ap.open_page(args.browser, env) as page:
+        res = ap.apply_job(page, job, profile, plan, d["packet"]["cover_note"], ROOT / profile.get("resume_file", "resume.pdf"),
+                           pk.parent.parent / "shots", submit=False)
+    print(json.dumps({"job": f"{job.title} at {job.company}", "status": res.status, "screenshots": res.shots, "required_fields_still_empty": res.unfilled}, indent=1))
+    return 0
 
 
 def approve(args, paths: Paths, env: dict) -> int:

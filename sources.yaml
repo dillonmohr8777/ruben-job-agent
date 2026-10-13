@@ -11,3 +11,5 @@ ashby: [posthog, zapier, ramp]
 workable: []
 rss: []          # e.g. https://weworkremotely.com/categories/remote-marketing-jobs.rss
 hn: true         # latest "Ask HN: Who is hiring?" thread
+# Lever and Ashby give only the slug, so tell the agent the real names (used in cover notes, the exclude list and the 90-day cooldown):
+names: {spotify: Spotify, posthog: PostHog, zapier: Zapier, ramp: Ramp}

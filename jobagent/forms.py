@@ -18,8 +18,9 @@ EEO = re.compile(r"gender|race|ethnic|hispanic|veteran|disabilit|sexual orientat
 
 # (label regex, key in profile.answers). First match wins; order matters.
 ANSWER_RULES = [
-    (r"sponsor", "requires_sponsorship"),
     (r"authori[sz]ed|legally|eligible to work|right to work", "work_authorized"),
+    (r"sponsor", "requires_sponsorship"),
+    (r"^\W*phone", "phone"),
     (r"linkedin", "linkedin"),
     (r"website|portfolio|github|personal site", "website"),
     (r"how did you (hear|find)|where did you (hear|find)|referral source", "how_did_you_hear"),
@@ -27,7 +28,8 @@ ANSWER_RULES = [
     (r"notice|start date|when can you start|availab", "start_availability"),
     (r"previously (worked|employed)|ever (been )?(employed|worked)|worked at or consulted|current or former|former employee", "previously_worked_here"),
     (r"employment agreement|post-employment|non-?compete|restrictions with your", "post_employment_restrictions"),
-    (r"preferred name|name you.d prefer|go by", "preferred_name"),
+    (r"preferred last name|legal last name", "last_name"),
+    (r"preferred (first )?name|name you.d prefer|go by", "preferred_name"),
     (r"country.*(reside|live|located|based)|where do you (live|reside)", "country"),
     (r"city|where are you (based|located)|current location", "location"),
     (r"acknowledge|privacy (policy|notice)|consent|agree", "privacy_ack"),   # consents are yours to give: blank = the agent asks

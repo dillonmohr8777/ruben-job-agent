@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import json
 import re
+import time
+import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
@@ -22,9 +24,15 @@ UA = "ruben-job-agent/0.1 (personal job search; reads public job-board APIs)"
 def http_get(url: str, data: dict | None = None, text: bool = False, timeout: float = 30):
     body = json.dumps(data).encode() if data is not None else None
     req = urllib.request.Request(url, data=body, headers={"User-Agent": UA, "Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        raw = r.read().decode("utf-8", "replace")
-    return raw if text else json.loads(raw)
+    for attempt in range(4):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                raw = r.read().decode("utf-8", "replace")
+            return raw if text else json.loads(raw)
+        except urllib.error.HTTPError as e:
+            if e.code not in (429, 502, 503) or attempt == 3:  # rate limited or briefly down: wait and retry, then name the board in the report
+                raise
+            time.sleep(min(10, float(e.headers.get("Retry-After") or 2 * (attempt + 1))))
 
 
 def _dt(s) -> datetime | None:
@@ -86,9 +94,17 @@ def ashby(slug: str, get=http_get) -> list[Job]:
 
 
 def workable(slug: str, get=http_get) -> list[Job]:
-    d = get(f"https://apply.workable.com/api/v3/accounts/{slug}/jobs", {"query": "", "location": [], "department": [], "worktype": [], "remote": []})
+    body = {"query": "", "location": [], "department": [], "worktype": [], "remote": []}
+    results, d = [], {}
+    for _ in range(40):  # the API returns 10 per page; without paging a 90-job board looked like a 10-job board
+        d = get(f"https://apply.workable.com/api/v3/accounts/{slug}/jobs", body)
+        results += d.get("results", [])
+        if not d.get("nextPage") or not d.get("results"):
+            break
+        body = {**body, "token": d["nextPage"]}
+        time.sleep(0.6)  # Workable rate-limits bursts of page requests
     out = []
-    for j in d.get("results", []):
+    for j in results:
         loc = ", ".join(x for x in [(j.get("location") or {}).get("city"), (j.get("location") or {}).get("country")] if x)
         out.append(Job("workable", slug, j["title"], f"https://apply.workable.com/{slug}/j/{j['shortcode']}/", "", loc,
                        True if j.get("remote") else None, _dt(j.get("published")), board=slug, ats_id=j["shortcode"],
@@ -156,13 +172,18 @@ FETCHERS = {"greenhouse": greenhouse, "lever": lever, "ashby": ashby, "workable"
 def fetch_all(cfg: dict, get=http_get, workers: int = 8) -> tuple[list[Job], list[str]]:
     """cfg is sources.yaml. Returns (jobs, errors). Errors name the board so a dead source is never mistaken for 'no jobs'."""
     tasks = [(kind, arg) for kind, args in cfg.items() if kind in FETCHERS for arg in args or []]
+    names = {k.lower(): v for k, v in (cfg.get("names") or {}).items()}  # Lever and Ashby give only the URL slug, not the company name
     if cfg.get("hn"):
         tasks.append(("hn", ""))
 
     def run(t):
         kind, arg = t
         try:
-            return (hn_hiring(get) if kind == "hn" else FETCHERS[kind](arg, get)), None
+            got = hn_hiring(get) if kind == "hn" else FETCHERS[kind](arg, get)
+            for j in got:
+                if j.ats in ("lever", "ashby") and j.board.lower() in names:
+                    j.company = names[j.board.lower()]
+            return got, None
         except Exception as e:  # noqa: BLE001 - named in the report below
             return [], f"{kind}:{arg or 'thread'} failed: {type(e).__name__}: {str(e)[:100]}"
 
