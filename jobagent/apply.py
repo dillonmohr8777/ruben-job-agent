@@ -1,0 +1,271 @@
+"""Browser step: fill a Greenhouse or Lever application, screenshot it, and (only with submit=True) press Submit.
+
+Browsers:  local      headless Chromium on this machine (free; use for dry runs)
+           browserbase  a cloud browser with a persistent context, so logins survive between runs, plus captcha solving
+
+Nothing here decides whether to apply. policy.decide does that. This module only does what it is told,
+refuses to touch EEO fields, and says VERIFIED only when the confirmation page actually appeared."""
+
+from __future__ import annotations
+
+import json
+import re
+import urllib.request
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from .forms import EEO, FormPlan
+from .models import Job
+
+BB_API = "https://api.browserbase.com/v1"
+CONFIRM_TEXT = re.compile(r"thank you for applying|thanks for applying|application (has been )?(submitted|received)|we.ve received your application|application submitted", re.I)
+CONFIRM_URL = re.compile(r"confirmation|/thanks|submitted", re.I)
+
+
+class ApplyError(RuntimeError):
+    pass
+
+
+@dataclass
+class ApplyResult:
+    status: str  # DRY_RUN | VERIFIED | FAILED
+    shots: list[str] = field(default_factory=list)
+    unfilled: list[str] = field(default_factory=list)  # required fields we could not fill
+    note: str = ""
+
+
+# --- browsers -----------------------------------------------------------------
+
+
+def _bb(method: str, path: str, key: str, body: dict | None = None) -> dict:
+    req = urllib.request.Request(BB_API + path, json.dumps(body).encode() if body is not None else None, method=method,
+                                 headers={"X-BB-API-Key": key, "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.load(r)
+
+
+def create_context(env: dict) -> str:
+    """One-time: makes the persistent Browserbase context that keeps your logins between runs."""
+    return _bb("POST", "/contexts", env["BROWSERBASE_API_KEY"], {"projectId": env["BROWSERBASE_PROJECT_ID"]})["id"]
+
+
+@contextmanager
+def open_page(mode: str, env: dict):
+    from playwright.sync_api import sync_playwright  # lazy: not needed for fetch/score/tailor
+
+    with sync_playwright() as p:
+        if mode == "local":
+            b = p.chromium.launch()
+            page = b.new_context(viewport={"width": 1280, "height": 1600}).new_page()
+            try:
+                yield page
+            finally:
+                b.close()
+            return
+        key, proj = env.get("BROWSERBASE_API_KEY"), env.get("BROWSERBASE_PROJECT_ID")
+        if not key or not proj:
+            raise ApplyError("set BROWSERBASE_API_KEY and BROWSERBASE_PROJECT_ID in .env")
+        settings = {"solveCaptchas": True}
+        if env.get("BROWSERBASE_CONTEXT_ID"):
+            settings["context"] = {"id": env["BROWSERBASE_CONTEXT_ID"], "persist": True}
+        sess = _bb("POST", "/sessions", key, {"projectId": proj, "proxies": True, "browserSettings": settings})
+        try:
+            b = p.chromium.connect_over_cdp(sess["connectUrl"])
+            ctx = b.contexts[0]
+            yield ctx.pages[0] if ctx.pages else ctx.new_page()
+        finally:
+            try:
+                _bb("POST", f"/sessions/{sess['id']}", key, {"projectId": proj, "status": "REQUEST_RELEASE"})
+            except Exception:  # noqa: BLE001 - a failed release only costs idle minutes; the session times out
+                pass
+
+
+def ensure_login(page, site: dict, login) -> None:
+    """Log in to a site from logins.yaml if the persistent session is not already signed in."""
+    page.goto(site["login_url"], wait_until="domcontentloaded")
+    if page.query_selector(site["logged_in"]):
+        return
+    page.fill(site["user"], login.username)
+    page.fill(site["pass"], login.password)
+    page.click(site["submit"])
+    try:
+        page.wait_for_selector(site["logged_in"], timeout=20000)
+    except Exception:  # noqa: BLE001
+        raise ApplyError(f"login to {site['login_url']} not confirmed (2FA or captcha?). Do it once by hand in the same context.") from None
+
+
+# --- helpers ------------------------------------------------------------------
+
+
+def _pick(page, name: str, value: str) -> None:
+    """Greenhouse's dropdowns are react-select comboboxes."""
+    page.click(f"#{name}")
+    opts = page.locator("[role=option], .select__option")
+    try:
+        opts.first.wait_for(timeout=3000)
+        texts = [t.strip() for t in opts.all_inner_texts()]
+        i = next((i for i, t in enumerate(texts) if t == value), None)
+        if i is None:  # 'United States +1' for 'United States'
+            i = next((i for i, t in enumerate(texts) if t.lower().startswith(value.lower())), None)
+        if i is not None:
+            opts.nth(i).click()
+            return
+    except Exception:  # noqa: BLE001 - fall through to typing
+        pass
+    page.keyboard.type(value)
+    page.keyboard.press("Enter")
+
+
+US_STATES = dict(a.split(":") for a in (
+    "AL:Alabama AK:Alaska AZ:Arizona AR:Arkansas CA:California CO:Colorado CT:Connecticut DE:Delaware FL:Florida GA:Georgia HI:Hawaii ID:Idaho "
+    "IL:Illinois IN:Indiana IA:Iowa KS:Kansas KY:Kentucky LA:Louisiana ME:Maine MD:Maryland MA:Massachusetts MI:Michigan MN:Minnesota "
+    "MS:Mississippi MO:Missouri MT:Montana NE:Nebraska NV:Nevada NH:New_Hampshire NJ:New_Jersey NM:New_Mexico NY:New_York NC:North_Carolina "
+    "ND:North_Dakota OH:Ohio OK:Oklahoma OR:Oregon PA:Pennsylvania RI:Rhode_Island SC:South_Carolina SD:South_Dakota TN:Tennessee TX:Texas "
+    "UT:Utah VT:Vermont VA:Virginia WA:Washington WV:West_Virginia WI:Wisconsin WY:Wyoming DC:District_of_Columbia").split())
+
+
+def _pick_location(page, text: str) -> None:
+    """Greenhouse's city field is a places autocomplete. Type the city, then click a suggestion that starts with the
+    city and names the right state. If nothing matches exactly, leave it empty: it is reported, never guessed."""
+    el = page.query_selector("#candidate-location")
+    if not el:
+        return
+    city, _, state = [x.strip() for x in (text + ",,").split(",")][:3]
+    state_full = US_STATES.get(state.upper(), state).replace("_", " ").lower()
+    el.click()
+    page.keyboard.type(city, delay=60)
+    try:
+        page.wait_for_selector(".select__option", timeout=6000)
+        for opt in page.query_selector_all(".select__option"):
+            t = opt.inner_text().strip().lower()
+            if t.startswith(city.lower() + ",") and (not state_full or state_full in t):
+                opt.click()
+                return
+    except Exception:  # noqa: BLE001
+        pass
+    page.keyboard.press("Escape")
+
+
+JS_UNFILLED = """() => [...document.querySelectorAll('input,textarea,select')].filter(e => {
+  const req = e.required || e.getAttribute('aria-required') === 'true';
+  if (!req || e.type === 'hidden' || e.type === 'checkbox' && e.checked) return false;
+  const box = e.closest('[class*="select__control"]');  // react-select keeps its value in a styled div, not the input
+  if (box && box.querySelector('[class*="single-value"],[class*="multi-value"]')) return false;
+  if (e.type === 'file') return e.files.length === 0;
+  return !(e.value || '').trim();
+}).map(e => {
+  const l = (e.id && document.querySelector(`label[for="${e.id}"]`)) || e.closest('label') || e.closest('fieldset,.field,.application-question,li,div');
+  return ((e.getAttribute('aria-label') || (l && l.innerText) || e.name || e.id || e.type) + '').trim().slice(0, 90);
+})"""
+
+
+def unfilled_required(page) -> list[str]:
+    return sorted({x for x in page.evaluate(JS_UNFILLED) if x})
+
+
+def _shot(page, shots: Path, tag: str) -> str:
+    shots.mkdir(parents=True, exist_ok=True)
+    f = shots / f"{tag}.png"
+    page.screenshot(path=str(f), full_page=True)
+    return str(f)
+
+
+# --- the two supported forms ----------------------------------------------------
+
+
+def _fill_greenhouse(page, plan: FormPlan, profile: dict, resume: Path, note_file: Path | None) -> None:
+    for f in plan.fills:
+        if f.kind == "select":
+            _pick(page, f.name, f.value)
+        else:
+            page.fill(f"#{f.name}", f.value)
+    c = profile.get("contact", {})
+    if c.get("country") and page.query_selector("#country"):
+        _pick(page, "country", c["country"])
+    if c.get("location"):
+        _pick_location(page, c["location"])
+    page.set_input_files("input#resume", str(resume))
+    if note_file and page.query_selector("input#cover_letter"):
+        page.set_input_files("input#cover_letter", str(note_file))
+    for name in (resume.name, note_file.name if note_file else None):  # wait for the uploads to finish, so the screenshot proves them
+        if name:
+            try:
+                page.get_by_text(name).first.wait_for(timeout=15000)
+            except Exception:  # noqa: BLE001
+                pass
+
+
+LEVER_FIELDS = {"name": "name", "email": "email", "phone": "phone", "org": "org", "location": "location",
+                "linkedin": "urls[LinkedIn]", "website": "urls[Portfolio]"}
+
+
+def _fill_lever(page, plan: FormPlan, profile: dict, resume: Path, note: str) -> None:
+    by = {f.name: f.value for f in plan.fills}
+    full = " ".join(x for x in (by.get("first_name"), by.get("last_name")) if x)
+    vals = {"name": full, "email": by.get("email"), "phone": by.get("phone"),
+            "org": ((profile.get("experience") or [{}])[0]).get("employer"),   # most recent employer, straight from the profile
+            "location": (profile.get("contact") or {}).get("location"),
+            "linkedin": (profile.get("contact") or {}).get("linkedin"), "website": (profile.get("contact") or {}).get("website")}
+    for key, name in LEVER_FIELDS.items():
+        el = page.query_selector(f'[name="{name}"]')
+        if not el or not vals.get(key):
+            continue
+        if key == "location":  # autocomplete: only a clicked suggestion counts
+            el.click()
+            page.keyboard.type(vals[key], delay=40)
+            city = vals[key].split(",")[0].strip().lower()
+            try:
+                page.wait_for_selector(".dropdown-location", timeout=5000)
+                for opt in page.query_selector_all(".dropdown-location"):
+                    if opt.inner_text().strip().lower().startswith(city):
+                        opt.click()
+                        break
+            except Exception:  # noqa: BLE001
+                pass
+        else:
+            el.fill(vals[key])
+    page.set_input_files('input[name="resume"]', str(resume))
+    if el := page.query_selector('textarea[name="comments"]'):
+        el.fill(note)
+
+
+def apply_job(page, job: Job, profile: dict, plan: FormPlan, cover_note: str, resume: Path, shots: Path, submit: bool = False) -> ApplyResult:
+    """submit=False fills and screenshots only. submit=True also presses Submit and requires the confirmation page."""
+    if job.ats not in ("greenhouse", "lever"):
+        raise ApplyError(f"{job.ats} is not an auto-apply form")
+    resume = Path(resume)
+    if not resume.exists():
+        raise ApplyError(f"resume not found: {resume}")
+    shots.mkdir(parents=True, exist_ok=True)
+    note_dir = shots / job.id  # the employer sees this filename, so keep it human
+    note_dir.mkdir(parents=True, exist_ok=True)
+    note_file = note_dir / f"{(profile.get('name') or 'Applicant').replace(' ', '-')}-cover-note.txt"
+    note_file.write_text(cover_note)
+    # Greenhouse boards on a company's own domain (stripe.com/jobs/...) all have this hosted form too.
+    url = (f"https://job-boards.greenhouse.io/{job.board}/jobs/{job.ats_id}" if job.ats == "greenhouse"
+           else f"https://jobs.lever.co/{job.board}/{job.ats_id}/apply")
+    page.goto(url, wait_until="networkidle", timeout=60000)
+    if job.ats == "greenhouse":
+        _fill_greenhouse(page, plan, profile, resume, note_file)
+    else:
+        _fill_lever(page, plan, profile, resume, cover_note)
+    out = ApplyResult("DRY_RUN", [_shot(page, shots, f"{job.id}-filled")])
+    out.unfilled = unfilled_required(page)
+    if out.unfilled:
+        out.note = "required fields still empty: " + "; ".join(out.unfilled[:5])
+        if any(EEO.search(x) for x in out.unfilled):
+            out.note += " (includes legal/EEO fields; those are never auto-filled)"
+        return out
+    if not submit:
+        return out
+    page.click('button[type="submit"]')
+    try:
+        page.wait_for_function(
+            "([t,u]) => new RegExp(t,'i').test(document.body.innerText) || new RegExp(u,'i').test(location.href)",
+            arg=[CONFIRM_TEXT.pattern, CONFIRM_URL.pattern], timeout=25000)
+        out.status = "VERIFIED"  # the employer's own confirmation page, not our click, is the proof
+    except Exception:  # noqa: BLE001
+        out.status, out.note = "FAILED", "no confirmation page after submit"
+    out.shots.append(_shot(page, shots, f"{job.id}-after"))
+    return out

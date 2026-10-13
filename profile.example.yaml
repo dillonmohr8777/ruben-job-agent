@@ -1,0 +1,100 @@
+# Your profile. Copy to profile.yaml (git-ignored) and replace everything below with YOUR real details.
+# This file is the ONLY source of facts the agent may use. It will never write a number, tool, employer,
+# title or credential that is not written here. The values below are a fictional person for testing.
+
+name: Alex Sample
+summary: Paid media and growth marketer with six years running Google and Meta ads for B2B software and ecommerce brands.
+resume_file: sample/sample_resume.pdf   # your real PDF, e.g. resume.pdf (git-ignored)
+
+contact:
+  email: alex.sample@example.com
+  phone: "555-0100"
+  location: Pittsburgh, PA
+  country: United States
+  linkedin: https://www.linkedin.com/in/alex-sample-example
+  website: ""
+
+# Things you are happy to be matched on. Add aliases for how job posts spell them.
+skills:
+  - {name: Google Ads, aliases: [AdWords, SEM, PPC]}
+  - {name: Meta Ads, aliases: [Facebook Ads, Instagram Ads, paid social]}
+  - {name: SEO, aliases: [search engine optimization]}
+  - {name: Google Analytics, aliases: [GA4]}
+  - {name: HubSpot}
+  - {name: A/B testing, aliases: [experimentation, split testing]}
+  - {name: Email marketing, aliases: [lifecycle, Klaviyo]}
+  - {name: Looker Studio, aliases: [Data Studio, dashboards]}
+  - {name: Content marketing, aliases: [content strategy]}
+
+# Real experience, most recent first. Each bullet is a fact you can defend in an interview.
+# Tag skills per bullet so the matcher can pick the right ones for each job.
+experience:
+  - employer: Northwind Software
+    title: Senior Paid Media Manager
+    start: 2022-04
+    end: present
+    bullets:
+      - text: Managed $85,000 a month in Google Ads and Meta Ads spend for a B2B SaaS product, cutting cost per lead by 31% in two quarters.
+        skills: [Google Ads, Meta Ads]
+      - text: Built a Looker Studio dashboard that replaced a weekly manual report and saved the team four hours a week.
+        skills: [Looker Studio, Google Analytics]
+      - text: Ran 40 landing page A/B tests with the design team, lifting demo-request conversion from 2.1% to 3.4%.
+        skills: [A/B testing]
+      - text: Set up HubSpot lead scoring with sales so paid leads were followed up within one business day.
+        skills: [HubSpot]
+  - employer: Brightside Goods
+    title: Digital Marketing Specialist
+    start: 2019-06
+    end: 2022-03
+    bullets:
+      - text: Grew organic search traffic 62% in 18 months through SEO audits, content updates and internal linking.
+        skills: [SEO, Content marketing]
+      - text: Launched a Klaviyo welcome and cart-abandonment flow that produced 14% of online revenue.
+        skills: [Email marketing]
+      - text: Managed $20,000 a month in Google Ads for an ecommerce store, improving return on ad spend from 2.8 to 4.1.
+        skills: [Google Ads]
+
+education:
+  - school: Penn State University
+    degree: Bachelor of Science, Marketing
+    year: 2019
+
+certifications: []
+
+# Facts the agent may use to answer application questions. Blank = it will NOT answer and will ask you instead.
+# For dropdowns, give a list of acceptable phrasings, best first; the first one that matches an option wins,
+# and if none match the agent asks you. EEO questions (gender, race, veteran, disability) are never answered by the agent.
+answers:
+  work_authorized: ["Yes", "I am authorized to work"]
+  requires_sponsorship: ["No"]
+  how_did_you_hear: ["Company careers page", "Company website", "Job board", "Other"]
+  salary_expectation: ""
+  start_availability: "Two weeks"
+  previously_worked_here: ["No"]
+  post_employment_restrictions: ["No"]
+  privacy_ack: ""                 # consents are yours to give. Fill in only if you are happy for the agent to tick them
+
+search:
+  target_titles:
+    - Paid Media Manager
+    - Performance Marketing Manager
+    - Growth Marketing Manager
+    - Demand Generation Manager
+    - Digital Marketing Manager
+    - SEO Manager
+    - Marketing Operations Manager
+    - Lifecycle Marketing Manager
+  exclude_title_words: [intern, director, vp, head, sales, engineer, recruiter, counsel]
+  exclude_companies: []
+  seniority: {min: mid, max: lead}        # intern, junior, mid, senior, lead, director, exec
+  locations:
+    remote_only: true
+    allowed_countries: [United States]
+    onsite_cities: []
+  min_salary: 80000                       # USD a year; a job whose top pay is below this is dropped. null = ignore
+  require_salary: false                   # true = drop jobs that do not state pay
+  visa:
+    needs_sponsorship: false
+    us_citizen: false
+  max_age_days: 7
+  allow_undated: false

@@ -1,0 +1,11 @@
+# Sites that need a login (most job forms do not: Greenhouse and Lever are open). Copy to logins.yaml (git-ignored).
+# vault_ref is a pointer to the item in Bitwarden (item id) or 1Password (item name); the password never touches this file.
+# Run once:  python -m jobagent login <site>     Browserbase then keeps you signed in (persistent context).
+# Google and LinkedIn block cloud browsers; do those by hand on your own computer.
+example_site:
+  login_url: https://example.com/login
+  user: "input[name=email]"
+  pass: "input[name=password]"
+  submit: "button[type=submit]"
+  logged_in: "[data-test=account-menu]"     # something that only exists when signed in
+  vault_ref: PUT-BITWARDEN-ITEM-ID-HERE

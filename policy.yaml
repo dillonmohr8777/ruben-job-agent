@@ -1,0 +1,6 @@
+# When may the agent submit on its own? Everything not listed here is "ask": it prepares the packet, you decide.
+auto_ats: [greenhouse, lever]   # simple, standard forms only. Workday, iCIMS, Indeed, LinkedIn and the rest are always "ask"
+auto_min_score: 80              # raise this, never lower it just to reach a number
+ask_min_score: 60               # below this a job is not even queued
+daily_cap: 8                    # attempts per day (failed tries count). Few good applications beat many weak ones
+company_cooldown_days: 90       # one application per company per quarter, unless you approve another

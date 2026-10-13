@@ -1,0 +1,13 @@
+# Public job boards. Add the slug from a company's jobs URL:
+#   boards.greenhouse.io/<slug>  or  job-boards.greenhouse.io/<slug>   -> greenhouse
+#   jobs.lever.co/<slug>                                               -> lever
+#   jobs.ashbyhq.com/<slug>                                            -> ashby
+#   apply.workable.com/<slug>                                          -> workable
+# A bad slug shows up by name in the run report; it never silently returns zero jobs.
+# Tip: smaller companies hire faster and compete less than the famous ones. Add 20-50 in your field.
+greenhouse: [affirm, mixpanel, airbnb, stripe, pinterest, instacart, databricks, gitlab, brex]
+lever: [spotify]
+ashby: [posthog, zapier, ramp]
+workable: []
+rss: []          # e.g. https://weworkremotely.com/categories/remote-marketing-jobs.rss
+hn: true         # latest "Ask HN: Who is hiring?" thread

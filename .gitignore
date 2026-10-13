@@ -1,0 +1,12 @@
+.env
+.venv/
+__pycache__/
+.pytest_cache/
+# personal data: your real profile, resume, ledger, outputs and tracker stay local
+profile.yaml
+resume.pdf
+logins.yaml
+data/
+out/
+STOP
+demo-profile.local.yaml

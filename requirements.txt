@@ -1,0 +1,4 @@
+pyyaml>=6
+pytest>=8
+# only needed for --live applying and the browser dry run:
+playwright>=1.48
