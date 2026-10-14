@@ -20,7 +20,7 @@ EEO = re.compile(r"gender|race|ethnic|hispanic|veteran|disabilit|sexual orientat
 ANSWER_RULES = [
     (r"authori[sz]ed|legally|eligible to work|right to work", "work_authorized"),
     (r"(located|reside|live|based) in the (u\.?s\.?|united states)|reside in (the )?u\.?s\b", "us_resident"),
-    (r"which (u\.?s\.? )?state|what state", "state"),
+    (r"which (u\.?s\.? )?state|what state|^\W*state\b|state ?/ ?province|state of residence", "state"),
     (r"(most recent|current).{0,20}employer|current company", "current_employer"),
     (r"(most recent|current).{0,20}(job )?title", "current_title"),
     (r"sponsor", "requires_sponsorship"),
@@ -36,7 +36,8 @@ ANSWER_RULES = [
     (r"preferred (first )?name|name you.d prefer|go by", "preferred_name"),
     (r"country.*(reside|live|located|based)|where do you (live|reside)", "country"),
     (r"city|where are you (based|located)|current location", "location"),
-    (r"acknowledge|privacy (policy|notice)|consent|agree", "privacy_ack"),   # consents are yours to give: blank = the agent asks
+    (r"privacy (policy|notice)|acknowledge", "privacy_ack"),   # reading the employer's applicant privacy notice is part of applying
+    (r"consent|agree", "consent"),   # SMS, marketing, recording consents are yours to give: never in answers, so the agent asks
 ]
 STANDARD_KEYS = {"first_name": "first_name", "last_name": "last_name", "email": "email", "phone": "phone"}
 

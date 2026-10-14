@@ -50,6 +50,7 @@ def test_residency_state_and_current_employer_come_from_the_profile(profile):
     import re
     key = lambda q: next((k for rx, k in ANSWER_RULES if re.search(rx, q, re.I)), None)
     assert key("Are you located in the United States?") == "us_resident"
-    assert key("Which U.S. state do you live in?") == "state"
+    assert key("Which U.S. state do you live in?") == "state" and key("State/Province of residence.") == "state"
+    assert key("Applicant Privacy Policy") == "privacy_ack" and key("I consent to receive SMS messages") == "consent"
     assert key("Who is your most recent/current employer?") == "current_employer"
     assert answers(profile)["current_employer"] == [profile["experience"][0]["employer"]]

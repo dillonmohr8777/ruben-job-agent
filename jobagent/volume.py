@@ -284,6 +284,7 @@ def run(jobs: list[Job], profile: dict, pol: dict, paths: pl.Paths, env: dict, *
         else:
             survivors.append(j)
     rows = tracker.load(paths.tracker)
+    rows = [r for r in rows if r.get("status") != "review"]   # queued jobs go through the gate again: a new profile answer may clear them
     survivors, rep.deduped = filters.dedupe(survivors, {r["job_id"] for r in rows} | {filters.canon_url(r["url"]) for r in rows})
 
     t = time.monotonic()
