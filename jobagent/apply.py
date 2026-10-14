@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import json
 import re
+import time
+import urllib.error
 import urllib.request
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -42,8 +44,14 @@ class ApplyResult:
 def _bb(method: str, path: str, key: str, body: dict | None = None) -> dict:
     req = urllib.request.Request(BB_API + path, json.dumps(body).encode() if body is not None else None, method=method,
                                  headers={"X-BB-API-Key": key, "Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return json.load(r)
+    for i in range(5):  # 429: back off (Retry-After, else doubling), then give up
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return json.load(r)
+        except urllib.error.HTTPError as e:
+            if e.code != 429 or i == 4:
+                raise
+            time.sleep(float(e.headers.get("Retry-After") or 2 ** (i + 1)))
 
 
 def create_context(env: dict) -> str:
@@ -52,7 +60,7 @@ def create_context(env: dict) -> str:
 
 
 @contextmanager
-def open_page(mode: str, env: dict):
+def open_page(mode: str, env: dict, meta: dict | None = None):
     from playwright.sync_api import sync_playwright  # lazy: not needed for fetch/score/tailor
 
     with sync_playwright() as p:
@@ -67,14 +75,18 @@ def open_page(mode: str, env: dict):
         key, proj = env.get("BROWSERBASE_API_KEY"), env.get("BROWSERBASE_PROJECT_ID")
         if not key or not proj:
             raise ApplyError("set BROWSERBASE_API_KEY and BROWSERBASE_PROJECT_ID in .env")
-        settings = {"solveCaptchas": True}
+        settings = {"solveCaptchas": False}   # a captcha is a stop sign for a human, never something the agent gets past
         if env.get("BROWSERBASE_CONTEXT_ID"):
             settings["context"] = {"id": env["BROWSERBASE_CONTEXT_ID"], "persist": True}
-        sess = _bb("POST", "/sessions", key, {"projectId": proj, "proxies": True, "browserSettings": settings})
+        sess = _bb("POST", "/sessions", key, {"projectId": proj, "proxies": env.get("BROWSERBASE_PROXIES") == "1", "browserSettings": settings,
+                                        "timeout": int(env.get("BROWSERBASE_TIMEOUT", 600)), "userMetadata": meta or {"agent": "job-agent"}})
         try:
             b = p.chromium.connect_over_cdp(sess["connectUrl"])
             ctx = b.contexts[0]
-            yield ctx.pages[0] if ctx.pages else ctx.new_page()
+            page = ctx.pages[0] if ctx.pages else ctx.new_page()
+            # proxy bandwidth is the plan's tight limit and forms need none of these
+            page.route("**/*", lambda r: r.abort() if r.request.resource_type in ("image", "media", "font") else r.continue_())
+            yield page
         finally:
             try:
                 _bb("POST", f"/sessions/{sess['id']}", key, {"projectId": proj, "status": "REQUEST_RELEASE"})
@@ -296,6 +308,8 @@ JS_ASHBY_UNFILLED = """() => [...document.querySelectorAll('[class*="_fieldEntry
   const lab = e.querySelector('label');
   if (!lab || !/_required_/.test(lab.className)) return false;
   if (e.querySelector('.ashby-application-form-input-yesno')) return !e.querySelector('[aria-pressed=true]');   // a 'No' leaves the hidden checkbox unchecked
+  const tx = e.querySelector('input[type=tel],input[type=text],input[type=email],textarea');
+  if (tx && tx.value.trim()) return false;   // Ashby's Phone carries optional SMS/WhatsApp consent radios; the number is the answer
   const boxes = [...e.querySelectorAll('input[type=checkbox],input[type=radio]')];
   if (boxes.length) return !boxes.some(b => b.checked);
   const f = e.querySelector('input[type=file]');
@@ -370,6 +384,8 @@ def _submit_ashby(page) -> tuple[bool, str]:
     except Exception as e:  # noqa: BLE001 - playwright TimeoutError: nothing was sent
         if page.evaluate(JS_CAPTCHA_SHOWN):   # a human-check challenge is a stop sign; the agent never solves or works around it
             return False, "NOT SUBMITTED: a captcha challenge appeared after Submit and was not completed; nothing was sent"
+        if re.search(r"thank you for applying", page.inner_text("body"), re.I):   # Ashby's own success banner; its reply came after the wait
+            return True, ""
         return False, f"Submit sent nothing within 60s (the form's own validation probably blocked it): {type(e).__name__}"
     try:
         body = r.json()
@@ -416,16 +432,21 @@ def apply_job(page, job: Job, profile: dict, plan: FormPlan, cover_note: str, re
         return out
     if job.ats == "ashby":
         ok, why = _submit_ashby(page)
-        out.status, out.note = ("VERIFIED", "") if ok else ("FAILED", why)
+        out.status, out.note = ("VERIFIED", "") if ok else ("BLOCKED" if why.startswith("NOT SUBMITTED") else "FAILED", why)
         out.shots.append(_shot(page, shots, f"{job.id}-after"))
         return out
-    page.click('button[type="submit"]')
+    try:  # Lever parses the resume first and its Submit is not clickable until then
+        page.wait_for_function("() => !/analyzing resume/i.test(document.body.innerText)", timeout=30000)
+    except Exception:  # noqa: BLE001
+        pass
+    page.get_by_role("button", name=re.compile(r"^\s*submit( application)?\s*$", re.I)).first.click()   # not Lever's hidden #hcaptchaSubmitBtn
     try:
         page.wait_for_function(
             "([t,u]) => new RegExp(t,'i').test(document.body.innerText) || new RegExp(u,'i').test(location.href)",
             arg=[CONFIRM_TEXT.pattern, CONFIRM_URL.pattern], timeout=25000)
         out.status = "VERIFIED"  # the employer's own confirmation page, not our click, is the proof
     except Exception:  # noqa: BLE001
-        out.status, out.note = "FAILED", "no confirmation page after submit"
+        captcha = re.search(r"complete the recaptcha|captcha", page.inner_text("body"), re.I) or page.evaluate(JS_CAPTCHA_SHOWN)
+        out.status, out.note = ("BLOCKED", "NOT SUBMITTED: the form asked for a captcha; nothing was sent") if captcha else ("FAILED", "no confirmation page after submit")
     out.shots.append(_shot(page, shots, f"{job.id}-after"))
     return out

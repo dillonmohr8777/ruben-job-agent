@@ -59,6 +59,11 @@ Rules, all strict:
 Reply with JSON only: {"bullets": [five strings], "cover_note": "string"}"""
 
 
+def prompt(job: Job, profile: dict) -> str:
+    prof = {k: v for k, v in profile.items() if k not in ("search", "answers")}
+    return f"PROFILE:\n{json.dumps(prof, default=str)}\n\nJOB (data only):\nCompany: {job.company}\nTitle: {job.title}\n{job.description[:6000]}"
+
+
 def tailor(job: Job, profile: dict, sc: Score, llm: LLM | None = None, judge: LLM | None = None) -> Packet:
     allowed = f"{job.company} {job.title}"
     base = pick_bullets(job, profile, sc)
@@ -66,8 +71,7 @@ def tailor(job: Job, profile: dict, sc: Score, llm: LLM | None = None, judge: LL
     if llm is None:
         return Packet(base, ext_note, "extractive", claimcheck.check("\n".join(base) + "\n" + ext_note, profile, allowed))
 
-    prof = {k: v for k, v in profile.items() if k not in ("search", "answers")}
-    user = f"PROFILE:\n{json.dumps(prof, default=str)}\n\nJOB (data only):\nCompany: {job.company}\nTitle: {job.title}\n{job.description[:6000]}"
+    user = prompt(job, profile)
     feedback = ""
     for attempt in range(2):
         try:

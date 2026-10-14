@@ -159,4 +159,4 @@ def test_ashby_captcha_challenge_is_reported_as_such_and_nothing_is_sent(tmp_pat
         res, seen = _ashby_run(tmp_path, profile, OK, submit=True)
     finally:
         ASHBY_PAGE = saved
-    assert res.status == "FAILED" and "captcha" in res.note and not seen
+    assert res.status == "BLOCKED" and "captcha" in res.note and not seen

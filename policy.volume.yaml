@@ -1,0 +1,6 @@
+# Volume mode (`python -m jobagent volume`). Same gate as policy.yaml, wider ATS list and a higher daily cap.
+auto_ats: [greenhouse, lever, ashby]   # Workable, Workday, iCIMS, freelance boards and the rest become packets for review
+auto_min_score: 70                     # Jev fit minus the deterministic penalties
+ask_min_score: 60
+daily_cap: 300                         # attempts per day, failed tries included
+company_cooldown_days: 90
