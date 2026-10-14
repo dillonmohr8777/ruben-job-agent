@@ -6,7 +6,7 @@ import argparse
 import json
 import os
 import sys
-from datetime import date
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import yaml
@@ -52,6 +52,8 @@ def main(argv: list[str] | None = None) -> int:
     a.add_argument("job_id")
     a.add_argument("--browser", choices=["local", "browserbase"], default="browserbase")
     a.add_argument("--dry", action="store_true", help="fill and screenshot only")
+    a.add_argument("--allow-empty", action="append", default=[], metavar="LABEL",
+                   help="a required-looking question you have decided to leave blank (repeatable), e.g. an SMS consent")
     f = sub.add_parser("fill", help="open one queued job's real form in a local browser, fill it, screenshot it, and stop. Never submits.")
     f.add_argument("job_id")
     f.add_argument("--browser", choices=["local", "browserbase"], default="local")
@@ -67,6 +69,19 @@ def main(argv: list[str] | None = None) -> int:
     lg = sub.add_parser("login", help="sign in to a site from logins.yaml using your password manager; the session persists in the context")
     lg.add_argument("site")
     sub.add_parser("browser-context", help="one-time: create the persistent Browserbase context for logins")
+    v = sub.add_parser("volume", help="volume mode: Jev scoring, batched Haiku drafts, parallel browsers. Submits unless --dry.")
+    v.add_argument("--profile", default="profile.yaml")
+    v.add_argument("--policy", default="policy.volume.yaml")
+    v.add_argument("--sources", help="a sources.yaml to fetch live")
+    v.add_argument("--jobs-csv", action="append", default=[], help="a search's jobs.csv (repeatable)")
+    v.add_argument("--packets", nargs="*", default=[], help="submit these already-prepared packet .json files instead of searching")
+    v.add_argument("--browsers", type=int, default=10, help="parallel sessions; the plan allows 25, leave the rest for other work")
+    v.add_argument("--gap", type=float, default=5.0, help="seconds between application starts on the same ATS")
+    v.add_argument("--until", default="01:25", help="local HH:MM after which nothing new starts")
+    v.add_argument("--browser", choices=["local", "browserbase"], default="browserbase")
+    v.add_argument("--dry", action="store_true", help="fill and screenshot, never submit")
+    v.add_argument("--max", type=int, help="submit at most this many in this run (a first batch), still under the daily cap")
+    v.add_argument("--no-model", action="store_true", help="verbatim profile bullets only")
     args = ap_.parse_args(argv)
 
     env, paths = load_env(), Paths(Path(args.home))
@@ -110,6 +125,8 @@ def main(argv: list[str] | None = None) -> int:
             ap.ensure_login(page, site, creds)
         print(f"signed in to {args.site}; the session is saved in your Browserbase context")
         return 0
+    if args.cmd == "volume":
+        return volume_cmd(args, paths, env)
     if args.cmd == "browser-context":
         print("BROWSERBASE_CONTEXT_ID=" + ap.create_context(env))
         return 0
@@ -151,10 +168,57 @@ def approve(args, paths: Paths, env: dict) -> int:
     profile = _yaml(ROOT / "profile.yaml")
     with ap.open_page(args.browser, env) as page:
         res = ap.apply_job(page, job, profile, plan, d["packet"]["cover_note"], ROOT / profile.get("resume_file", "resume.pdf"),
-                           paths.out / "shots", submit=not args.dry)
+                           paths.out / "shots", submit=not args.dry, allow_empty=tuple(args.allow_empty))
     ledger.append(paths.ledger, {"action": "apply", "id": job.id, "company": job.company, "title": job.title, "url": job.url, "ats": job.ats,
                                  "status": res.status, "decision": "human-approved", "note": res.note, "shots": res.shots})
     if res.status == "VERIFIED":
         tracker.mark_applied(paths.tracker, job.id, 7, shots=";".join(res.shots))
     print(res.status, res.note)
     return 0 if res.status in ("VERIFIED", "DRY_RUN") else 1
+
+
+def _until(hhmm: str, now: datetime | None = None) -> datetime | None:
+    """Next local HH:MM, or None inside the 01:30-09:30 quiet window (nothing may start then)."""
+    now = now or datetime.now().astimezone()
+    if 90 <= now.hour * 60 + now.minute < 570:
+        return None
+    h, m = map(int, hhmm.split(":"))
+    t = now.replace(hour=h, minute=m, second=0, microsecond=0)
+    return t if t > now else t + timedelta(days=1)
+
+
+def volume_cmd(args, paths: Paths, env: dict) -> int:
+    from types import SimpleNamespace
+
+    from . import pipeline as pl
+    from . import sources, volume
+    from .policy import Decision
+    from .scoring import Score
+    deadline = _until(args.until)
+    if deadline is None:
+        print("quiet hours (01:30-09:30): nothing starts now", file=sys.stderr)
+        return 2
+    profile, pol = _yaml(ROOT / args.profile), _yaml(ROOT / args.policy)
+    if args.packets:  # already scored, tailored and claim-checked: just submit them, same browsers, same proof
+        items = []
+        for p in args.packets:
+            d = json.loads(Path(p).read_text())
+            items.append(pl.Item(Job(**{**d["job"], "posted": None}), Score(d["score"]["total"], d["score"]["parts"]),
+                                 SimpleNamespace(cover_note=d["packet"]["cover_note"]),
+                                 FormPlan(fills=[Fill(**f) for f in d["plan"]["fills"]], blockers=d["plan"]["blockers"]),
+                                 Decision("auto", "prepared packet")))
+        print(volume.apply_many(items, profile, ROOT / profile.get("resume_file", "resume.pdf"), paths, env, browsers=args.browsers,
+                          gap=args.gap, deadline=deadline, submit=not args.dry, browser=args.browser))
+        for it in items:
+            print(it.result.status, it.job.company, "|", it.job.title, "|", it.result.note[:160])
+        return 0
+    jobs, errors = sources.fetch_all(_yaml(ROOT / args.sources)) if args.sources else ([], [])
+    for c in args.jobs_csv:
+        jobs += volume.from_csv(Path(c))
+    rep, bench = volume.run(jobs, profile, pol, paths, env, browsers=args.browsers, gap=args.gap, deadline=deadline, submit=not args.dry,
+                            model=not args.no_model, judge=llm.from_env(env, "JUDGE_MODEL") if env.get("JUDGE_MODEL") else None,
+                            browser=args.browser, errors=errors, max_submits=args.max)
+    (paths.out / "bench.json").write_text(json.dumps(bench, indent=1))
+    print((paths.out / "report.md").read_text())
+    print(json.dumps(bench, indent=1))
+    return 0

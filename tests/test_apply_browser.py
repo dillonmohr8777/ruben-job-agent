@@ -1,4 +1,6 @@
 """Real Chromium against a local page: proves the 'required fields still empty' judge and that dry runs never submit."""
+import json
+
 import pytest
 
 from jobagent import apply as ap
@@ -56,10 +58,69 @@ def test_ashby_fill_answers_known_fields_reports_the_rest_and_never_submits(tmp_
         raise
 
 
-def test_ashby_submit_is_refused(tmp_path):
+def test_ashby_verdict_needs_the_real_success_type_not_just_a_200():
+    ok = {"data": {"submitApplicationFormAction": {"applicationFormResult": {"__typename": "FormSubmitSuccess"}}}}
+    assert ap.ashby_verdict(200, ok) == (True, "")
+    assert not ap.ashby_verdict(500, ok)[0]
+    assert not ap.ashby_verdict(200, {"errors": [{"message": "boom"}]})[0]
+    assert not ap.ashby_verdict(200, {"data": {"submitApplicationFormAction": {"applicationFormResult": {"__typename": "FormRender", "errorMessages": [{"message": "bad"}]}}}})[0]
+    spam = {"data": {"submitApplicationFormAction": {"applicationFormResult": {"__typename": "FormRender"}, "messages": {"blockMessageForCandidateHtml": "flagged as spam"}}}}
+    assert "spam" in ap.ashby_verdict(200, spam)[1]
+    assert not ap.ashby_verdict(200, {})[0]
+
+
+SUBMIT_URL = "https://jobs.ashbyhq.com/api/non-user-graphql?op=ApiSubmitSingleApplicationFormAction"
+APP_URL = "https://jobs.ashbyhq.com/x/1/application"
+# Decoys: the page says "thank you for applying" before anything is sent, and another type=submit button comes first.
+ASHBY_PAGE = """<body>Thank you for applying (this sentence is always on the page)
+<form onsubmit="event.preventDefault();fetch('%s',{method:'POST',body:'{}'}).then(r=>r.json()).then(j=>{document.title='SENT'})">
+<button type=submit onclick="document.title='WRONG BUTTON'">Upload file</button>
+<div><label for=_systemfield_name>Name</label><input type=text id=_systemfield_name required></div>
+<div><label for=_systemfield_email>Email</label><input type=email id=_systemfield_email required></div>
+<div><label for=_systemfield_resume>Resume</label><input type=file id=_systemfield_resume required></div>
+%s<button type=submit>Submit Application</button></form></body>"""
+
+
+def _ashby_run(tmp_path, profile, reply, extra="", **kw):
+    """Real apply_job on a local Ashby-shaped page; the employer's reply is scripted. Returns (result, requests seen)."""
+    from jobagent.forms import plan_basic
     from jobagent.models import Job
-    with pytest.raises(ap.ApplyError, match="not verified"):
-        ap.apply_job(None, Job("ashby", "X", "t", "u", board="x", ats_id="1"), {}, None, "", __file__, tmp_path, submit=True)
+    seen = []
+    resume = tmp_path / "resume.pdf"
+    resume.write_bytes(b"%PDF-1.4 test")
+    try:
+        with ap.open_page("local", {}) as page:
+            page.route("**/*", lambda r: r.abort())   # registered first = lowest priority: nothing leaves the machine
+            page.route(APP_URL, lambda r: r.fulfill(status=200, content_type="text/html", body=ASHBY_PAGE % (SUBMIT_URL, extra)))
+            def submit(r):
+                seen.append(r.request.post_data)
+                r.fulfill(status=200, content_type="application/json", headers={"access-control-allow-origin": "*"}, body=json.dumps(reply))
+            page.route(SUBMIT_URL, submit)
+            job = Job("ashby", "X", "t", APP_URL, board="x", ats_id="1")
+            return ap.apply_job(page, job, profile, plan_basic(profile), "note", resume, tmp_path / "shots", **kw), seen
+    except Exception as e:  # noqa: BLE001
+        if "Executable doesn't exist" in str(e):
+            pytest.skip("run `playwright install chromium`")
+        raise
+
+
+OK = {"data": {"submitApplicationFormAction": {"applicationFormResult": {"__typename": "FormSubmitSuccess"}}}}
+REJECTED = {"data": {"submitApplicationFormAction": {"applicationFormResult": {"__typename": "FormRender", "errorMessages": []}}}}
+
+
+def test_ashby_submit_is_verified_only_by_the_success_reply(tmp_path, profile):
+    res, seen = _ashby_run(tmp_path, profile, OK, submit=True)
+    assert res.status == "VERIFIED" and len(seen) == 1          # one submit request, from the right button
+    res, seen = _ashby_run(tmp_path, profile, REJECTED, submit=True)
+    assert res.status == "FAILED" and "did not accept" in res.note   # the 'thank you' text on the page does not count
+
+
+def test_ashby_unanswered_required_question_blocks_submit_until_a_human_allows_it(tmp_path, profile):
+    extra = '<div class="_fieldEntry_a"><label class="_required_a" for=sms>SMS consent</label><input id=sms type=text></div>'
+    res, seen = _ashby_run(tmp_path, profile, OK, extra, submit=True)
+    assert res.status == "DRY_RUN" and "SMS consent" in res.note and not seen    # nothing was sent
+    res, seen = _ashby_run(tmp_path, profile, OK, extra, submit=True, allow_empty=("sms consent",))
+    assert res.status == "VERIFIED" and len(seen) == 1
 
 
 LEVER_RADIO_HTML = """<form>
@@ -87,3 +148,15 @@ def test_radio_questions_are_answered_from_the_profile_and_unanswered_groups_are
         if "Executable doesn't exist" in str(e):
             pytest.skip("run `playwright install chromium`")
         raise
+
+
+def test_ashby_captcha_challenge_is_reported_as_such_and_nothing_is_sent(tmp_path, profile):
+    global ASHBY_PAGE
+    saved = ASHBY_PAGE
+    ASHBY_PAGE = saved.replace("</form>", "</form><iframe title='recaptcha challenge' style='width:300px;height:400px'></iframe>").replace(
+        "fetch('%s'", "void('%s'")
+    try:
+        res, seen = _ashby_run(tmp_path, profile, OK, submit=True)
+    finally:
+        ASHBY_PAGE = saved
+    assert res.status == "BLOCKED" and "captcha" in res.note and not seen

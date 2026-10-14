@@ -117,8 +117,8 @@ titles, not the volume. Change those before sending more.
 
 - **Indeed and LinkedIn are not automated.** They need logins and captchas and restrict automation. Use the
   review list for those.
-- Only Greenhouse and Lever are auto-submitted. Ashby forms are filled and screenshotted (`fill <id>`) but submitting them is
-  refused until someone proves it. Workable, HN and RSS jobs become packets for you. Workable rate-limits hard: keep that list short.
+- Only Greenhouse and Lever are auto-submitted by the gate. Ashby forms are filled and screenshotted (`fill <id>`), and you submit one with
+  `approve <id>`: it is VERIFIED only when Ashby's own submit reply says `FormSubmitSuccess` (not because of text on the page). Workable, HN and RSS jobs become packets for you. Workable rate-limits hard: keep that list short.
 - Consent questions (SMS, privacy) and free-text essays are never answered for you. They show up as "required fields still empty".
 - The claim check is deliberately strict. It checks numbers (in context, and "more than 10" is not "10+"), names, tools, credential words,
   size words and employer attributions. In a mutation test of 22 deliberate lies the regex checks caught 20; the two it missed were plain prose
@@ -149,3 +149,20 @@ real browser.
 `tailor.py` bullets and note | `claimcheck.py` the outside judge | `forms.py` form planning |
 `policy.py` the gate | `apply.py` browser step | `ledger.py`, `tracker.py` records |
 `vault.py` password manager | `pipeline.py`, `cli.py` glue
+
+## Volume mode
+
+`python -m jobagent volume --sources sources.yaml [--jobs-csv jobs.csv] --browser local --browsers 6 [--max 25]`
+(run it under a launcher that sets `OPENROUTER_API_KEY`; set `LLM_API_KEY` and `JUDGE_MODEL` for the second judge).
+
+- Hard filters stay deterministic. Fit is a typed Jev score (24 calls in parallel), minus the same red-flag and
+  years-of-experience penalties as `run`. Drafts come from Haiku 25 at a time through `fast-worker` (zero data retention)
+  and still pass the claim check and second judge, or fall back to verbatim profile bullets.
+- Gate: `policy.volume.yaml` (bar 70, cap 300/day, one company per 90 days). Only Greenhouse is auto-submitted:
+  Ashby and Lever showed an hCaptcha challenge to automated browsers on every submit we tried, and a captcha is a stop
+  sign (recorded BLOCKED, nothing sent, no cooldown). Those jobs, Workable, aggregators and anything with an essay,
+  salary or consent question become packets for a human.
+- Greenhouse emails an 8-character code before it accepts an application; the agent reads it from Gmail through the
+  `composio` CLI (never logged).
+- Breakers: an adapter pauses after 3 misses in a row or under 80% confirmed; the run halts above 20% misses in the
+  last 20. `STOP` file and `--until HH:MM` stop new work; nothing starts 01:30-09:30.

@@ -164,9 +164,30 @@ def hn_hiring(get=http_get, max_comments: int = 800) -> list[Job]:
     return out
 
 
+# --- freelance / contract boards (apply links are resolved to an ATS when they lead to one; the rest become packets) --
+
+
+def remoteok(tag: str, get=http_get) -> list[Job]:
+    out = []
+    for j in get(f"https://remoteok.com/api?tag={tag}"):
+        if not j.get("position"):
+            continue  # the first element is the API's legal notice
+        out.append(Job("remoteok", j.get("company", ""), j["position"], j.get("url", ""), html_to_text(j.get("description", "")),
+                       j.get("location") or "Remote", True, _dt(j.get("date")), int(j.get("salary_min") or 0) or None,
+                       int(j.get("salary_max") or 0) or None, ats_id=str(j.get("id")), extra={"apply_url": j.get("apply_url", "")}))
+    return out
+
+
+def workingnomads(category: str, get=http_get) -> list[Job]:
+    return [Job("workingnomads", j.get("company_name", ""), j["title"], j["url"], html_to_text(j.get("description", "")), j.get("location", ""),
+                True, _dt(j.get("pub_date")), ats_id=j["url"])
+            for j in get("https://www.workingnomads.com/api/exposed_jobs/") if category.lower() in (j.get("category_name") or "").lower()]
+
+
 # --- run everything ---------------------------------------------------------
 
-FETCHERS = {"greenhouse": greenhouse, "lever": lever, "ashby": ashby, "workable": workable, "rss": rss}
+FETCHERS = {"greenhouse": greenhouse, "lever": lever, "ashby": ashby, "workable": workable, "rss": rss, "remoteok": remoteok,
+            "workingnomads": workingnomads}
 
 
 def fetch_all(cfg: dict, get=http_get, workers: int = 8) -> tuple[list[Job], list[str]]:

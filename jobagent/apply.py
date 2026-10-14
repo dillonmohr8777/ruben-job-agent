@@ -10,6 +10,11 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
+import subprocess
+import time
+from datetime import datetime
+import urllib.error
 import urllib.request
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -21,6 +26,35 @@ from .models import Job
 BB_API = "https://api.browserbase.com/v1"
 CONFIRM_TEXT = re.compile(r"thank you for applying|thanks for applying|application (has been )?(submitted|received)|we.ve received your application|application submitted", re.I)
 CONFIRM_URL = re.compile(r"confirmation|/thanks|submitted", re.I)
+ASHBY_SUBMIT_OP = "ApiSubmitSingleApplicationFormAction"   # the GraphQL mutation Ashby's own form sends on Submit
+
+
+CODE_SENT = re.compile(r"verification code was sent|enter the \d-character code|security code", re.I)
+
+
+def email_code(company: str, since: float, wait: int = 120) -> str | None:
+    """The newest Greenhouse security-code email for this company, read through the composio CLI (Gmail). Never logged."""
+    if not shutil.which("composio"):
+        return None
+    q = json.dumps({"query": "from:greenhouse-mail.io newer_than:1d", "max_results": 5, "include_payload": True, "verbose": True})
+    for _ in range(wait // 10):
+        time.sleep(10)
+        r = subprocess.run(["composio", "execute", "GMAIL_FETCH_EMAILS", "-d", q], capture_output=True, text=True, timeout=60)
+        try:
+            d = json.loads(r.stdout)
+            if d.get("storedInFile"):  # large replies are written to a temp file instead of stdout
+                f = Path(d["outputFilePath"])
+                d = json.loads(f.read_text())
+                f.unlink(missing_ok=True)   # it holds the code
+            msgs = (d.get("data") or d)["messages"]
+        except Exception:  # noqa: BLE001
+            continue
+        for m in msgs:
+            ts = datetime.fromisoformat(m.get("messageTimestamp", "1970-01-01T00:00:00Z").replace("Z", "+00:00")).timestamp()
+            if ts >= since - 60 and company.lower() in (m.get("subject") or "").lower():
+                if hit := re.search(r"<h1>\s*([A-Za-z0-9]{8})\s*</h1>", json.dumps(m)):
+                    return hit.group(1)
+    return None
 
 
 class ApplyError(RuntimeError):
@@ -41,8 +75,14 @@ class ApplyResult:
 def _bb(method: str, path: str, key: str, body: dict | None = None) -> dict:
     req = urllib.request.Request(BB_API + path, json.dumps(body).encode() if body is not None else None, method=method,
                                  headers={"X-BB-API-Key": key, "Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return json.load(r)
+    for i in range(5):  # 429: back off (Retry-After, else doubling), then give up
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return json.load(r)
+        except urllib.error.HTTPError as e:
+            if e.code != 429 or i == 4:
+                raise
+            time.sleep(float(e.headers.get("Retry-After") or 2 ** (i + 1)))
 
 
 def create_context(env: dict) -> str:
@@ -51,7 +91,7 @@ def create_context(env: dict) -> str:
 
 
 @contextmanager
-def open_page(mode: str, env: dict):
+def open_page(mode: str, env: dict, meta: dict | None = None):
     from playwright.sync_api import sync_playwright  # lazy: not needed for fetch/score/tailor
 
     with sync_playwright() as p:
@@ -66,14 +106,18 @@ def open_page(mode: str, env: dict):
         key, proj = env.get("BROWSERBASE_API_KEY"), env.get("BROWSERBASE_PROJECT_ID")
         if not key or not proj:
             raise ApplyError("set BROWSERBASE_API_KEY and BROWSERBASE_PROJECT_ID in .env")
-        settings = {"solveCaptchas": True}
+        settings = {"solveCaptchas": False}   # a captcha is a stop sign for a human, never something the agent gets past
         if env.get("BROWSERBASE_CONTEXT_ID"):
             settings["context"] = {"id": env["BROWSERBASE_CONTEXT_ID"], "persist": True}
-        sess = _bb("POST", "/sessions", key, {"projectId": proj, "proxies": True, "browserSettings": settings})
+        sess = _bb("POST", "/sessions", key, {"projectId": proj, "proxies": env.get("BROWSERBASE_PROXIES") == "1", "browserSettings": settings,
+                                        "timeout": int(env.get("BROWSERBASE_TIMEOUT", 600)), "userMetadata": meta or {"agent": "job-agent"}})
         try:
             b = p.chromium.connect_over_cdp(sess["connectUrl"])
             ctx = b.contexts[0]
-            yield ctx.pages[0] if ctx.pages else ctx.new_page()
+            page = ctx.pages[0] if ctx.pages else ctx.new_page()
+            # proxy bandwidth is the plan's tight limit and forms need none of these
+            page.route("**/*", lambda r: r.abort() if r.request.resource_type in ("image", "media", "font") else r.continue_())
+            yield page
         finally:
             try:
                 _bb("POST", f"/sessions/{sess['id']}", key, {"projectId": proj, "status": "REQUEST_RELEASE"})
@@ -295,6 +339,8 @@ JS_ASHBY_UNFILLED = """() => [...document.querySelectorAll('[class*="_fieldEntry
   const lab = e.querySelector('label');
   if (!lab || !/_required_/.test(lab.className)) return false;
   if (e.querySelector('.ashby-application-form-input-yesno')) return !e.querySelector('[aria-pressed=true]');   // a 'No' leaves the hidden checkbox unchecked
+  const tx = e.querySelector('input[type=tel],input[type=text],input[type=email],textarea');
+  if (tx && tx.value.trim()) return false;   // Ashby's Phone carries optional SMS/WhatsApp consent radios; the number is the answer
   const boxes = [...e.querySelectorAll('input[type=checkbox],input[type=radio]')];
   if (boxes.length) return !boxes.some(b => b.checked);
   const f = e.querySelector('input[type=file]');
@@ -339,12 +385,52 @@ def _ashby_yes_no_and_location(page, profile: dict) -> None:
                 page.keyboard.press("Escape")
 
 
-def apply_job(page, job: Job, profile: dict, plan: FormPlan, cover_note: str, resume: Path, shots: Path, submit: bool = False) -> ApplyResult:
-    """submit=False fills and screenshots only. submit=True also presses Submit and requires the confirmation page."""
+def ashby_verdict(status: int, body: dict) -> tuple[bool, str]:
+    """Judge Ashby's submit response. Ashby's own page treats `applicationFormResult.__typename == "FormSubmitSuccess"` as the
+    moment the application exists (it only then shows its thank-you screen), so that is the signal here, not any page text."""
+    if status != 200:
+        return False, f"submit returned HTTP {status}"
+    if body.get("errors"):
+        return False, "submit error: " + "; ".join(str(e.get("message", e))[:120] for e in body["errors"][:3])
+    act = (body.get("data") or {}).get("submitApplicationFormAction") or {}
+    res = act.get("applicationFormResult") or {}
+    if res.get("__typename") == "FormSubmitSuccess":
+        return True, ""
+    blocked = ((act.get("messages") or {}).get("blockMessageForCandidateHtml") or "").strip()
+    errs = [e.get("message", "") for e in (res.get("errorMessages") or []) + (res.get("formErrors") or []) if isinstance(e, dict)]
+    return False, f"Ashby did not accept it: {res.get('__typename') or 'no result'} {blocked[:160]} {'; '.join(errs)[:160]}".strip()
+
+
+JS_CAPTCHA_SHOWN = """() => [...document.querySelectorAll('iframe')].some(f => /recaptcha|hcaptcha|captcha/i.test((f.src || '') + (f.title || ''))
+  && /challenge|bframe|hcaptcha-challenge/i.test((f.src || '') + (f.title || '')) && f.getBoundingClientRect().height > 100)"""
+
+
+def _submit_ashby(page) -> tuple[bool, str]:
+    """Press Submit Application (not the other type=submit buttons on the form, such as Upload file or Yes/No) and read Ashby's reply."""
+    btn = page.get_by_role("button", name=re.compile(r"^\s*submit application", re.I))
+    try:
+        with page.expect_response(lambda r: ASHBY_SUBMIT_OP in r.url, timeout=60000) as info:
+            btn.first.click()
+        r = info.value
+    except Exception as e:  # noqa: BLE001 - playwright TimeoutError: nothing was sent
+        if page.evaluate(JS_CAPTCHA_SHOWN):   # a human-check challenge is a stop sign; the agent never solves or works around it
+            return False, "NOT SUBMITTED: a captcha challenge appeared after Submit and was not completed; nothing was sent"
+        if re.search(r"thank you for applying", page.inner_text("body"), re.I):   # Ashby's own success banner; its reply came after the wait
+            return True, ""
+        return False, f"Submit sent nothing within 60s (the form's own validation probably blocked it): {type(e).__name__}"
+    try:
+        body = r.json()
+    except Exception:  # noqa: BLE001
+        return False, f"submit reply was not JSON (HTTP {r.status})"
+    return ashby_verdict(r.status, body)
+
+
+def apply_job(page, job: Job, profile: dict, plan: FormPlan, cover_note: str, resume: Path, shots: Path, submit: bool = False,
+              allow_empty: tuple[str, ...] = ()) -> ApplyResult:
+    """submit=False fills and screenshots only. submit=True also presses Submit and requires the employer's confirmation.
+    allow_empty: labels a human has said may stay blank (for example an SMS-consent question). Anything else empty blocks the submit."""
     if job.ats not in ("greenhouse", "lever", "ashby"):
         raise ApplyError(f"{job.ats} is not an auto-apply form")
-    if job.ats == "ashby" and submit:
-        raise ApplyError("Ashby forms can be filled and screenshotted, but submitting them is not verified yet")
     resume = Path(resume)
     if not resume.exists():
         raise ApplyError(f"resume not found: {resume}")
@@ -358,29 +444,62 @@ def apply_job(page, job: Job, profile: dict, plan: FormPlan, cover_note: str, re
            "greenhouse": f"https://job-boards.greenhouse.io/embed/job_app?for={job.board}&token={job.ats_id}",
            "lever": f"https://jobs.lever.co/{job.board}/{job.ats_id}/apply",
            "ashby": f"https://jobs.ashbyhq.com/{job.board}/{job.ats_id}/application"}[job.ats]
-    page.goto(url, wait_until="networkidle", timeout=60000)
-    if job.ats == "greenhouse":
-        _fill_greenhouse(page, plan, profile, resume, note_file)
-    elif job.ats == "lever":
-        _fill_lever(page, plan, profile, resume, cover_note)
-    else:
-        _fill_ashby(page, plan, profile, resume, cover_note)
+    try:  # nothing has reached the employer yet: a failure here is NOT_SENT, which never starts the 90-day cooldown
+        page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        try:
+            page.wait_for_load_state("networkidle", timeout=15000)   # Lever pages with live analytics never go idle
+        except Exception:  # noqa: BLE001
+            pass
+        if job.ats == "greenhouse":
+            _fill_greenhouse(page, plan, profile, resume, note_file)
+        elif job.ats == "lever":
+            _fill_lever(page, plan, profile, resume, cover_note)
+        else:
+            _fill_ashby(page, plan, profile, resume, cover_note)
+    except Exception as e:  # noqa: BLE001
+        return ApplyResult("NOT_SENT", note=f"{type(e).__name__}: {str(e)[:160]}")
     out = ApplyResult("DRY_RUN", [_shot(page, shots, f"{job.id}-filled")])
     out.unfilled = sorted(set(page.evaluate(JS_ASHBY_UNFILLED))) if job.ats == "ashby" else unfilled_required(page)
-    if out.unfilled:
+    blocking = [x for x in out.unfilled if not any(a.lower() in x.lower() for a in allow_empty if a.strip())]
+    if blocking or (out.unfilled and not submit):
         out.note = "required fields still empty: " + "; ".join(out.unfilled[:5])
         if any(EEO.search(x) for x in out.unfilled):
             out.note += " (includes legal/EEO fields; those are never auto-filled)"
         return out
     if not submit:
         return out
-    page.click('button[type="submit"]')
+    if job.ats == "ashby":
+        ok, why = _submit_ashby(page)
+        out.status, out.note = ("VERIFIED", "") if ok else ("BLOCKED" if why.startswith("NOT SUBMITTED") else "FAILED", why)
+        out.shots.append(_shot(page, shots, f"{job.id}-after"))
+        return out
+    try:  # Lever parses the resume first and its Submit is not clickable until then
+        page.wait_for_function("() => !/analyzing resume/i.test(document.body.innerText)", timeout=30000)
+    except Exception:  # noqa: BLE001
+        pass
+    submit_btn = page.get_by_role("button", name=re.compile(r"^\s*submit( application)?\s*$", re.I)).first   # not Lever's hidden #hcaptchaSubmitBtn
+    sent_at = time.time()
+    submit_btn.click()
     try:
         page.wait_for_function(
-            "([t,u]) => new RegExp(t,'i').test(document.body.innerText) || new RegExp(u,'i').test(location.href)",
-            arg=[CONFIRM_TEXT.pattern, CONFIRM_URL.pattern], timeout=25000)
+            "([t,u,c]) => new RegExp(t,'i').test(document.body.innerText) || new RegExp(u,'i').test(location.href) || new RegExp(c,'i').test(document.body.innerText)",
+            arg=[CONFIRM_TEXT.pattern, CONFIRM_URL.pattern, CODE_SENT.pattern], timeout=25000)
+        if CODE_SENT.search(page.inner_text("body")) and not CONFIRM_TEXT.search(page.inner_text("body")):
+            code = email_code(job.company, sent_at)   # Greenhouse emails the applicant an 8-character code; it proves the address, it is not a captcha
+            if not code:
+                raise ApplyError("security code email not found")
+            page.locator("input[id^=security-input], input[name*=security]").first.click()
+            page.keyboard.type(code)
+            submit_btn.click()
+            page.wait_for_function("([t,u]) => new RegExp(t,'i').test(document.body.innerText) || new RegExp(u,'i').test(location.href)",
+                                   arg=[CONFIRM_TEXT.pattern, CONFIRM_URL.pattern], timeout=25000)
         out.status = "VERIFIED"  # the employer's own confirmation page, not our click, is the proof
-    except Exception:  # noqa: BLE001
-        out.status, out.note = "FAILED", "no confirmation page after submit"
+    except Exception as e:  # noqa: BLE001
+        captcha = re.search(r"complete the recaptcha", page.inner_text("body"), re.I) or page.evaluate(JS_CAPTCHA_SHOWN)
+        if not captcha and isinstance(e, ApplyError):
+            out.status, out.note = "FAILED", str(e)
+            out.shots.append(_shot(page, shots, f"{job.id}-after"))
+            return out
+        out.status, out.note = ("BLOCKED", "NOT SUBMITTED: the form asked for a captcha; nothing was sent") if captcha else ("FAILED", "no confirmation page after submit")
     out.shots.append(_shot(page, shots, f"{job.id}-after"))
     return out
