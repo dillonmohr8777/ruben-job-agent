@@ -21,6 +21,7 @@ from .models import Job
 BB_API = "https://api.browserbase.com/v1"
 CONFIRM_TEXT = re.compile(r"thank you for applying|thanks for applying|application (has been )?(submitted|received)|we.ve received your application|application submitted", re.I)
 CONFIRM_URL = re.compile(r"confirmation|/thanks|submitted", re.I)
+ASHBY_SUBMIT_OP = "ApiSubmitSingleApplicationFormAction"   # the GraphQL mutation Ashby's own form sends on Submit
 
 
 class ApplyError(RuntimeError):
@@ -339,12 +340,50 @@ def _ashby_yes_no_and_location(page, profile: dict) -> None:
                 page.keyboard.press("Escape")
 
 
-def apply_job(page, job: Job, profile: dict, plan: FormPlan, cover_note: str, resume: Path, shots: Path, submit: bool = False) -> ApplyResult:
-    """submit=False fills and screenshots only. submit=True also presses Submit and requires the confirmation page."""
+def ashby_verdict(status: int, body: dict) -> tuple[bool, str]:
+    """Judge Ashby's submit response. Ashby's own page treats `applicationFormResult.__typename == "FormSubmitSuccess"` as the
+    moment the application exists (it only then shows its thank-you screen), so that is the signal here, not any page text."""
+    if status != 200:
+        return False, f"submit returned HTTP {status}"
+    if body.get("errors"):
+        return False, "submit error: " + "; ".join(str(e.get("message", e))[:120] for e in body["errors"][:3])
+    act = (body.get("data") or {}).get("submitApplicationFormAction") or {}
+    res = act.get("applicationFormResult") or {}
+    if res.get("__typename") == "FormSubmitSuccess":
+        return True, ""
+    blocked = ((act.get("messages") or {}).get("blockMessageForCandidateHtml") or "").strip()
+    errs = [e.get("message", "") for e in (res.get("errorMessages") or []) + (res.get("formErrors") or []) if isinstance(e, dict)]
+    return False, f"Ashby did not accept it: {res.get('__typename') or 'no result'} {blocked[:160]} {'; '.join(errs)[:160]}".strip()
+
+
+JS_CAPTCHA_SHOWN = """() => [...document.querySelectorAll('iframe')].some(f => /recaptcha|hcaptcha|captcha/i.test((f.src || '') + (f.title || ''))
+  && /challenge|bframe|hcaptcha-challenge/i.test((f.src || '') + (f.title || '')) && f.getBoundingClientRect().height > 100)"""
+
+
+def _submit_ashby(page) -> tuple[bool, str]:
+    """Press Submit Application (not the other type=submit buttons on the form, such as Upload file or Yes/No) and read Ashby's reply."""
+    btn = page.get_by_role("button", name=re.compile(r"^\s*submit application", re.I))
+    try:
+        with page.expect_response(lambda r: ASHBY_SUBMIT_OP in r.url, timeout=60000) as info:
+            btn.first.click()
+        r = info.value
+    except Exception as e:  # noqa: BLE001 - playwright TimeoutError: nothing was sent
+        if page.evaluate(JS_CAPTCHA_SHOWN):   # a human-check challenge is a stop sign; the agent never solves or works around it
+            return False, "NOT SUBMITTED: a captcha challenge appeared after Submit and was not completed; nothing was sent"
+        return False, f"Submit sent nothing within 60s (the form's own validation probably blocked it): {type(e).__name__}"
+    try:
+        body = r.json()
+    except Exception:  # noqa: BLE001
+        return False, f"submit reply was not JSON (HTTP {r.status})"
+    return ashby_verdict(r.status, body)
+
+
+def apply_job(page, job: Job, profile: dict, plan: FormPlan, cover_note: str, resume: Path, shots: Path, submit: bool = False,
+              allow_empty: tuple[str, ...] = ()) -> ApplyResult:
+    """submit=False fills and screenshots only. submit=True also presses Submit and requires the employer's confirmation.
+    allow_empty: labels a human has said may stay blank (for example an SMS-consent question). Anything else empty blocks the submit."""
     if job.ats not in ("greenhouse", "lever", "ashby"):
         raise ApplyError(f"{job.ats} is not an auto-apply form")
-    if job.ats == "ashby" and submit:
-        raise ApplyError("Ashby forms can be filled and screenshotted, but submitting them is not verified yet")
     resume = Path(resume)
     if not resume.exists():
         raise ApplyError(f"resume not found: {resume}")
@@ -367,12 +406,18 @@ def apply_job(page, job: Job, profile: dict, plan: FormPlan, cover_note: str, re
         _fill_ashby(page, plan, profile, resume, cover_note)
     out = ApplyResult("DRY_RUN", [_shot(page, shots, f"{job.id}-filled")])
     out.unfilled = sorted(set(page.evaluate(JS_ASHBY_UNFILLED))) if job.ats == "ashby" else unfilled_required(page)
-    if out.unfilled:
+    blocking = [x for x in out.unfilled if not any(a.lower() in x.lower() for a in allow_empty if a.strip())]
+    if blocking or (out.unfilled and not submit):
         out.note = "required fields still empty: " + "; ".join(out.unfilled[:5])
         if any(EEO.search(x) for x in out.unfilled):
             out.note += " (includes legal/EEO fields; those are never auto-filled)"
         return out
     if not submit:
+        return out
+    if job.ats == "ashby":
+        ok, why = _submit_ashby(page)
+        out.status, out.note = ("VERIFIED", "") if ok else ("FAILED", why)
+        out.shots.append(_shot(page, shots, f"{job.id}-after"))
         return out
     page.click('button[type="submit"]')
     try:

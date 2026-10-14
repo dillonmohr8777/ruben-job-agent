@@ -52,6 +52,8 @@ def main(argv: list[str] | None = None) -> int:
     a.add_argument("job_id")
     a.add_argument("--browser", choices=["local", "browserbase"], default="browserbase")
     a.add_argument("--dry", action="store_true", help="fill and screenshot only")
+    a.add_argument("--allow-empty", action="append", default=[], metavar="LABEL",
+                   help="a required-looking question you have decided to leave blank (repeatable), e.g. an SMS consent")
     f = sub.add_parser("fill", help="open one queued job's real form in a local browser, fill it, screenshot it, and stop. Never submits.")
     f.add_argument("job_id")
     f.add_argument("--browser", choices=["local", "browserbase"], default="local")
@@ -151,7 +153,7 @@ def approve(args, paths: Paths, env: dict) -> int:
     profile = _yaml(ROOT / "profile.yaml")
     with ap.open_page(args.browser, env) as page:
         res = ap.apply_job(page, job, profile, plan, d["packet"]["cover_note"], ROOT / profile.get("resume_file", "resume.pdf"),
-                           paths.out / "shots", submit=not args.dry)
+                           paths.out / "shots", submit=not args.dry, allow_empty=tuple(args.allow_empty))
     ledger.append(paths.ledger, {"action": "apply", "id": job.id, "company": job.company, "title": job.title, "url": job.url, "ats": job.ats,
                                  "status": res.status, "decision": "human-approved", "note": res.note, "shots": res.shots})
     if res.status == "VERIFIED":

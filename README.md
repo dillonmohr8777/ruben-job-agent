@@ -117,8 +117,8 @@ titles, not the volume. Change those before sending more.
 
 - **Indeed and LinkedIn are not automated.** They need logins and captchas and restrict automation. Use the
   review list for those.
-- Only Greenhouse and Lever are auto-submitted. Ashby forms are filled and screenshotted (`fill <id>`) but submitting them is
-  refused until someone proves it. Workable, HN and RSS jobs become packets for you. Workable rate-limits hard: keep that list short.
+- Only Greenhouse and Lever are auto-submitted by the gate. Ashby forms are filled and screenshotted (`fill <id>`), and you submit one with
+  `approve <id>`: it is VERIFIED only when Ashby's own submit reply says `FormSubmitSuccess` (not because of text on the page). Workable, HN and RSS jobs become packets for you. Workable rate-limits hard: keep that list short.
 - Consent questions (SMS, privacy) and free-text essays are never answered for you. They show up as "required fields still empty".
 - The claim check is deliberately strict. It checks numbers (in context, and "more than 10" is not "10+"), names, tools, credential words,
   size words and employer attributions. In a mutation test of 22 deliberate lies the regex checks caught 20; the two it missed were plain prose
