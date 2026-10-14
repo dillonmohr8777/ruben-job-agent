@@ -19,6 +19,10 @@ EEO = re.compile(r"gender|race|ethnic|hispanic|veteran|disabilit|sexual orientat
 # (label regex, key in profile.answers). First match wins; order matters.
 ANSWER_RULES = [
     (r"authori[sz]ed|legally|eligible to work|right to work", "work_authorized"),
+    (r"(located|reside|live|based) in the (u\.?s\.?|united states)|reside in (the )?u\.?s\b", "us_resident"),
+    (r"which (u\.?s\.? )?state|what state", "state"),
+    (r"(most recent|current).{0,20}employer|current company", "current_employer"),
+    (r"(most recent|current).{0,20}(job )?title", "current_title"),
     (r"sponsor", "requires_sponsorship"),
     (r"^\W*phone", "phone"),
     (r"linkedin", "linkedin"),
@@ -59,7 +63,9 @@ def answers(profile: dict) -> dict[str, str]:
     first, _, last = (c.get("full_name") or profile.get("name", "")).partition(" ")
     base = {"first_name": c.get("first_name") or first, "last_name": c.get("last_name") or last, "email": c.get("email", ""),
             "phone": c.get("phone", ""), "linkedin": c.get("linkedin", ""), "website": c.get("website", ""),
-            "location": c.get("location", ""), "country": c.get("country", ""), "preferred_name": c.get("first_name") or first}
+            "location": c.get("location", ""), "country": c.get("country", ""), "preferred_name": c.get("first_name") or first,
+            "current_employer": (profile.get("experience") or [{}])[0].get("employer", ""),   # straight from the profile, newest first
+            "current_title": (profile.get("experience") or [{}])[0].get("title", "")}
     out: dict[str, list[str]] = {}
     for k, v in {**base, **a}.items():
         vals = [str(x).strip() for x in (v if isinstance(v, list) else [v]) if x not in (None, "") and str(x).strip()]

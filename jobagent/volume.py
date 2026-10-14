@@ -72,10 +72,28 @@ def from_csv(path: Path) -> list[Job]:
         r = {k.strip().lower(): (v or "").strip() for k, v in r.items() if k}
         url = r.get("apply_url") or r.get("url", "")
         ats, board, ats_id = ats_from_url(url) or (r.get("ats") or "csv", r.get("board", ""), r.get("ats_id") or r.get("id") or url)
-        out.append(Job(ats, r.get("company", ""), r.get("title", ""), url, r.get("description", ""), r.get("location", ""),
+        out.append(Job(ats, r.get("company", ""), r.get("title", ""), url, r.get("description") or r.get("desc") or " | ".join(r[k] for k in ("type", "hours", "pay", "why it fits") if r.get(k)), r.get("location", ""),
                        {"true": True, "yes": True, "false": False, "no": False}.get(r.get("remote", "").lower()),
                        sources._dt(r.get("posted") or r.get("published") or r.get("date")), board=board, ats_id=ats_id))
     return out
+
+
+def describe(jobs: list[Job], get=sources.http_get) -> None:
+    """A search export often has no job description. Read it from the ATS board (one call per board) so Jev and the writer see the real posting."""
+    need = {(j.ats, j.board) for j in jobs if not len(j.description) > 400 and j.ats in ("greenhouse", "lever", "ashby") and j.board}
+
+    def board(key):
+        try:
+            return {x.ats_id: x for x in sources.FETCHERS[key[0]](key[1], get)}
+        except Exception:  # noqa: BLE001 - keep the thin description; the score will say so
+            return {}
+
+    with ThreadPoolExecutor(8) as ex:
+        boards = dict(zip(need, ex.map(board, need)))
+    for j in jobs:
+        if (full := boards.get((j.ats, j.board), {}).get(j.ats_id)) is not None:
+            j.description, j.location = full.description, j.location or full.location
+            j.posted, j.remote = j.posted or full.posted, j.remote if j.remote is not None else full.remote
 
 
 def target_text(profile: dict) -> str:
@@ -258,6 +276,7 @@ def run(jobs: list[Job], profile: dict, pol: dict, paths: pl.Paths, env: dict, *
         deadline: datetime | None = None, submit: bool = True, model: bool = True, judge=None, browser: str = "browserbase",
         errors: list[str] | None = None, now: datetime | None = None, max_submits: int | None = None) -> tuple[pl.Report, dict]:
     now, rep, bench = now or datetime.now(timezone.utc), pl.Report(fetched=len(jobs), errors=list(errors or [])), {}
+    describe(jobs)
     survivors = []
     for j in jobs:
         if r := filters.hard_filter(j, profile, now):

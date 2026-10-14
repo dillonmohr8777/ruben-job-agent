@@ -444,13 +444,20 @@ def apply_job(page, job: Job, profile: dict, plan: FormPlan, cover_note: str, re
            "greenhouse": f"https://job-boards.greenhouse.io/embed/job_app?for={job.board}&token={job.ats_id}",
            "lever": f"https://jobs.lever.co/{job.board}/{job.ats_id}/apply",
            "ashby": f"https://jobs.ashbyhq.com/{job.board}/{job.ats_id}/application"}[job.ats]
-    page.goto(url, wait_until="networkidle", timeout=60000)
-    if job.ats == "greenhouse":
-        _fill_greenhouse(page, plan, profile, resume, note_file)
-    elif job.ats == "lever":
-        _fill_lever(page, plan, profile, resume, cover_note)
-    else:
-        _fill_ashby(page, plan, profile, resume, cover_note)
+    try:  # nothing has reached the employer yet: a failure here is NOT_SENT, which never starts the 90-day cooldown
+        page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        try:
+            page.wait_for_load_state("networkidle", timeout=15000)   # Lever pages with live analytics never go idle
+        except Exception:  # noqa: BLE001
+            pass
+        if job.ats == "greenhouse":
+            _fill_greenhouse(page, plan, profile, resume, note_file)
+        elif job.ats == "lever":
+            _fill_lever(page, plan, profile, resume, cover_note)
+        else:
+            _fill_ashby(page, plan, profile, resume, cover_note)
+    except Exception as e:  # noqa: BLE001
+        return ApplyResult("NOT_SENT", note=f"{type(e).__name__}: {str(e)[:160]}")
     out = ApplyResult("DRY_RUN", [_shot(page, shots, f"{job.id}-filled")])
     out.unfilled = sorted(set(page.evaluate(JS_ASHBY_UNFILLED))) if job.ats == "ashby" else unfilled_required(page)
     blocking = [x for x in out.unfilled if not any(a.lower() in x.lower() for a in allow_empty if a.strip())]

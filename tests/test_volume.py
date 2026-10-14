@@ -43,3 +43,13 @@ def test_greenhouse_code_is_read_from_the_newest_matching_email(tmp_path, monkey
     assert ap.email_code("Walker Sands", since, wait=10) == "Ab3dE6gH" and not f.exists()
     f.write_text(json.dumps({"data": {"messages": [msg]}}))
     assert ap.email_code("Found", since, wait=10) is None          # another company's code is never used
+
+
+def test_residency_state_and_current_employer_come_from_the_profile(profile):
+    from jobagent.forms import ANSWER_RULES, answers
+    import re
+    key = lambda q: next((k for rx, k in ANSWER_RULES if re.search(rx, q, re.I)), None)
+    assert key("Are you located in the United States?") == "us_resident"
+    assert key("Which U.S. state do you live in?") == "state"
+    assert key("Who is your most recent/current employer?") == "current_employer"
+    assert answers(profile)["current_employer"] == [profile["experience"][0]["employer"]]
