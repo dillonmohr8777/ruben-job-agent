@@ -18,7 +18,7 @@ EEO = re.compile(r"gender|race|ethnic|hispanic|veteran|disabilit|sexual orientat
 
 # (label regex, key in profile.answers). First match wins; order matters.
 ANSWER_RULES = [
-    (r"authori[sz]ed|legally|eligible to work|right to work", "work_authorized"),
+    (r"authori[sz]ed|authori[sz]ation|legally|eligible to work|right to work", "work_authorized"),
     (r"(located|reside|live|based) in the (u\.?s\.?|united states)|reside in (the )?u\.?s\b", "us_resident"),
     (r"which (u\.?s\.? )?state|what state|^\W*state\b|state ?/ ?province|state of residence", "state"),
     (r"(most recent|current).{0,20}employer|current company", "current_employer"),
@@ -27,7 +27,8 @@ ANSWER_RULES = [
     (r"^\W*phone", "phone"),
     (r"linkedin", "linkedin"),
     (r"website|portfolio|github|personal site", "website"),
-    (r"how did you (hear|find)|where did you (hear|find)|referral source", "how_did_you_hear"),
+    (r"how did you (first )?(hear|find|learn)|where did you (first )?(hear|find|learn)|referral source", "how_did_you_hear"),
+    (r"time ?zone", "timezone"),
     (r"salary|compensation|pay expectation", "salary_expectation"),
     (r"notice|start date|when can you start|availab", "start_availability"),
     (r"previously (worked|employed)|ever (been )?(employed|worked)|worked at or consulted|current or former|former employee", "previously_worked_here"),
