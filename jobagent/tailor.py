@@ -93,3 +93,49 @@ def tailor(job: Job, profile: dict, sc: Score, llm: LLM | None = None, judge: LL
         feedback = f"\n\nYour last draft contained claims not in PROFILE ({rep}). Rewrite without them."
     return Packet(base, ext_note, "model-rejected-fell-back", claimcheck.check("\n".join(base) + "\n" + ext_note, profile, allowed),
                   [f"model draft rejected twice by claim check: {rep}"])
+
+
+# --- templates: no model call at all -------------------------------------------------------------------
+# Five fixed notes. The only job-specific words are the company, the title and two of the candidate's own verbatim resume
+# bullets, so there is nothing to invent; claimcheck still reads the finished note before anything is sent.
+TEMPLATES = {
+    "paid": "Hi {company} team,\n\nI'd like to be considered for the {title} role. Paid media is a big part of my day to day, and these two things line up closest with what you're hiring for:\n{proof}\n\nI'm remote in Pittsburgh and happy to start with a short call or a small first project.\n\n{name}",
+    "search": "Hi {company} team,\n\nI'm applying for the {title} role. Search and content are a big part of my work, and these two things are the closest match to what you need:\n{proof}\n\nI work remotely from Pittsburgh and can jump on a quick call whenever it helps.\n\n{name}",
+    "web": "Hi {company} team,\n\nI'm reaching out about the {title} role. I work on websites and landing pages next to the marketing side, and these two things are the closest match:\n{proof}\n\nI'm remote in Pittsburgh and glad to start small if that's easier.\n\n{name}",
+    "ai": "Hi {company} team,\n\nI'm applying for the {title} role. AI-assisted workflows are a big part of how I work, and these two things are the closest match to the role:\n{proof}\n\nI'm remote in Pittsburgh and happy to talk through a first project.\n\n{name}",
+    "general": "Hi {company} team,\n\nI'm applying for the {title} role. Marketing is what I do every day, and these two things are the closest match to what you're hiring for:\n{proof}\n\nI'm remote in Pittsburgh and happy to set up a short call.\n\n{name}",
+}
+FAMILY = [("paid", r"\b(ads?|ppc|paid|sem|media buyer|performance|campaign|google|meta|media planner)\b"),
+          ("ai", r"\b(ai|automation|agent|workflow|prompt|llm)\b"),
+          ("web", r"\b(wordpress|web|shopify|webflow|front.?end|landing|ux|developer|engineer)\b"),
+          ("search", r"\b(seo|aeo|geo|content|copy|copywriter|editor|writer|blog|social|community|email|lifecycle|creator)\b")]
+
+
+def template_family(title: str) -> str:
+    import re
+    return next((k for k, rx in FAMILY if re.search(rx, title, re.I)), "general")
+
+
+def clean_title(title: str) -> str:
+    """The note names the role, not the posting's pay, hours or requisition number: keep the title up to the first ' - ' segment that is one of those."""
+    import re
+    title = re.sub(r"\s*\([^)]*\d[^)]*\)", "", title.strip())   # "(3-6 month contract)", "(5+ Years Experience)", "(107-10SENG-01)"
+    title = re.sub(r"^(#?\d+|[A-Z0-9]*\d[A-Z0-9]*)\s*[-–]?\s+(?=[A-Za-z])", "", title)   # a leading requisition number
+    title = re.sub(r"^(1099\s+)?(CONTRACTOR|FREELANCE)\s*[-–]\s*", "", title)
+    keep = []
+    for seg in re.split(r"\s[-–|]\s", title.strip()):
+        if keep and re.search(r"\d|part[- ]time|full[- ]time|remote|contract|freelance|hybrid", seg, re.I):
+            break
+        keep.append(seg)
+    return " - ".join(keep) or title.strip()
+
+
+def template_packet(job: Job, profile: dict) -> Packet:
+    """The deterministic writer: a fixed note plus two verbatim bullets, claim-checked like every other writer."""
+    sc = Score(0, {}, [], [])
+    bullets = pick_bullets(job, profile, sc)
+    fam = template_family(job.title)
+    proof = "\n".join(f"- {b}" for b in bullets[:2])
+    note = TEMPLATES[fam].format(company=_company(job), title=clean_title(job.title), proof=proof, name=profile["name"])
+    rep = claimcheck.check("\n".join(bullets) + "\n" + note, profile, f"{job.company} {job.title}")
+    return Packet(bullets, note, f"template:{fam}", rep)

@@ -323,7 +323,8 @@ def _fill_ashby(page, plan: FormPlan, profile: dict, resume: Path, note: str) ->
     c = profile.get("contact", {})
     page.fill("#_systemfield_name", " ".join(x for x in (by.get("first_name"), by.get("last_name")) if x))
     page.fill("#_systemfield_email", by.get("email", ""))
-    page.set_input_files("#_systemfield_resume", str(resume))
+    if page.query_selector("#_systemfield_resume"):   # some Ashby forms have no resume field (video or portfolio link instead)
+        page.set_input_files("#_systemfield_resume", str(resume))
     for label, value in (("linkedin", c.get("linkedin")), ("phone", c.get("phone")), ("website|portfolio", c.get("website")),
                          ("cover letter|additional information|anything else", note)):
         if value:
@@ -385,6 +386,38 @@ def _ashby_yes_no_and_location(page, profile: dict) -> None:
                 page.keyboard.press("Escape")
 
 
+def _fill_workable(page, plan: FormPlan, profile: dict, resume: Path, note: str, url: str) -> None:
+    """jobs.workable.com shows the application inline after 'Apply now'. Fields are named by their question id; a cookie
+    banner's backdrop blocks real clicks, so the button is clicked in the page."""
+    page.goto(url, wait_until="domcontentloaded", timeout=60000)
+    page.wait_for_selector("[data-ui=overview-apply-now]", timeout=25000)
+    for t in ("Accept all", "Accept", "Got it"):
+        try:
+            page.get_by_role("button", name=re.compile("^" + t, re.I)).first.click(timeout=1200)
+            break
+        except Exception:  # noqa: BLE001
+            pass
+    page.evaluate("() => document.querySelector('[data-ui=overview-apply-now]').click()")
+    page.wait_for_selector("input[name=firstname]", timeout=25000)
+    for f in plan.fills:
+        if f.kind == "choice":
+            page.evaluate("""([name, want]) => { for (const r of document.querySelectorAll(`input[name="${name}"]`)) {
+                const l = ((r.labels && r.labels[0]) || r.parentElement).innerText.trim().toLowerCase();
+                if (l === want.toLowerCase()) { (r.labels && r.labels[0] || r).click(); return true; } } return false; }""", [f.name, f.value])
+            continue
+        el = page.query_selector(f'[name="{f.name}"]')
+        if el:
+            el.fill(f.value)
+    if page.query_selector('input[type=file][accept*=".pdf"]'):
+        page.set_input_files('input[type=file][accept*=".pdf"]', str(resume))
+    if el := page.query_selector('textarea[name="cover_letter"]'):
+        el.fill(note)
+    try:
+        page.get_by_text(resume.name).first.wait_for(timeout=15000)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def ashby_verdict(status: int, body: dict) -> tuple[bool, str]:
     """Judge Ashby's submit response. Ashby's own page treats `applicationFormResult.__typename == "FormSubmitSuccess"` as the
     moment the application exists (it only then shows its thank-you screen), so that is the signal here, not any page text."""
@@ -425,11 +458,31 @@ def _submit_ashby(page) -> tuple[bool, str]:
     return ashby_verdict(r.status, body)
 
 
+WK_DONE = re.compile(r"application (has been )?(submitted|received|sent)|thank you for (applying|your application)|thanks for applying|we.ve received your application|successfully (applied|submitted)", re.I)
+
+
+def _submit_workable(page, out: ApplyResult, shots: Path, job: Job) -> ApplyResult:
+    """The proof is Workable's own confirmation text after Submit; a captcha or a validation error is reported, never worked around."""
+    page.get_by_role("button", name=re.compile(r"^\s*submit application", re.I)).first.click()
+    try:
+        page.wait_for_function("(t) => new RegExp(t,'i').test(document.body.innerText)", arg=WK_DONE.pattern, timeout=30000)
+        out.status = "VERIFIED"
+    except Exception:  # noqa: BLE001
+        body = page.inner_text("body")
+        if re.search(r"captcha|verify you are human|robot", body, re.I) or page.query_selector("iframe[src*='challenges.cloudflare.com']") or page.evaluate(JS_CAPTCHA_SHOWN):
+            out.status, out.note = "BLOCKED", "NOT SUBMITTED: the form asked for a captcha; nothing was sent"
+        else:
+            err = re.search(r"(please|required|invalid)[^\n]{0,100}", body, re.I)
+            out.status, out.note = "FAILED", "no confirmation after submit" + (f": {err.group(0)}" if err else "")
+    out.shots.append(_shot(page, shots, f"{job.id}-after"))
+    return out
+
+
 def apply_job(page, job: Job, profile: dict, plan: FormPlan, cover_note: str, resume: Path, shots: Path, submit: bool = False,
               allow_empty: tuple[str, ...] = ()) -> ApplyResult:
     """submit=False fills and screenshots only. submit=True also presses Submit and requires the employer's confirmation.
     allow_empty: labels a human has said may stay blank (for example an SMS-consent question). Anything else empty blocks the submit."""
-    if job.ats not in ("greenhouse", "lever", "ashby"):
+    if job.ats not in ("greenhouse", "lever", "ashby", "workable"):
         raise ApplyError(f"{job.ats} is not an auto-apply form")
     resume = Path(resume)
     if not resume.exists():
@@ -443,14 +496,20 @@ def apply_job(page, job: Job, profile: dict, plan: FormPlan, cover_note: str, re
     url = {# the embed form is the same hosted form, and it also works for boards whose job page lives on the company's own site (acme.com)
            "greenhouse": f"https://job-boards.greenhouse.io/embed/job_app?for={job.board}&token={job.ats_id}",
            "lever": f"https://jobs.lever.co/{job.board}/{job.ats_id}/apply",
-           "ashby": f"https://jobs.ashbyhq.com/{job.board}/{job.ats_id}/application"}[job.ats]
+           "ashby": f"https://jobs.ashbyhq.com/{job.board}/{job.ats_id}/application",
+           "workable": job.url}[job.ats]
     try:  # nothing has reached the employer yet: a failure here is NOT_SENT, which never starts the 90-day cooldown
-        page.goto(url, wait_until="domcontentloaded", timeout=60000)
-        try:
-            page.wait_for_load_state("networkidle", timeout=15000)   # Lever pages with live analytics never go idle
-        except Exception:  # noqa: BLE001
-            pass
-        if job.ats == "greenhouse":
+        if job.ats == "workable":
+            _fill_workable(page, plan, profile, resume, cover_note, url)
+        else:
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            try:
+                page.wait_for_load_state("networkidle", timeout=15000)   # Lever pages with live analytics never go idle
+            except Exception:  # noqa: BLE001
+                pass
+        if job.ats == "workable":
+            pass   # filled above
+        elif job.ats == "greenhouse":
             _fill_greenhouse(page, plan, profile, resume, note_file)
         elif job.ats == "lever":
             _fill_lever(page, plan, profile, resume, cover_note)
@@ -468,6 +527,8 @@ def apply_job(page, job: Job, profile: dict, plan: FormPlan, cover_note: str, re
         return out
     if not submit:
         return out
+    if job.ats == "workable":
+        return _submit_workable(page, out, shots, job)
     if job.ats == "ashby":
         ok, why = _submit_ashby(page)
         out.status, out.note = ("VERIFIED", "") if ok else ("BLOCKED" if why.startswith("NOT SUBMITTED") else "FAILED", why)

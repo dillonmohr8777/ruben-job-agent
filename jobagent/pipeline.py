@@ -124,6 +124,14 @@ def _form_plan(j: Job, profile: dict, get, rep: Report) -> forms.FormPlan:
             p = forms.plan_basic(profile)
             p.blockers.append("could not read the form's questions")
             return p
+    if j.ats == "workable":
+        try:
+            return forms.plan_workable(forms.fetch_workable_form(j.ats_id, get), profile)
+        except Exception as e:  # noqa: BLE001
+            rep.errors.append(f"workable form for {j.company}/{j.title} failed: {type(e).__name__}")
+            p = forms.plan_basic(profile)
+            p.blockers.append("could not read the form's questions")
+            return p
     return forms.plan_basic(profile)
 
 

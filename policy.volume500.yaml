@@ -1,0 +1,8 @@
+# The 500-role run (part-time / contract list). Dillon, Oct 13: "Drop the score bar wherever. Approved for all 500."
+# The fit-score floor is 0, so score never gates anything; every other gate in policy.decide stays (claims, open questions,
+# company cooldown, daily cap, STOP file). Greenhouse auto-submits. Lever, Ashby and Workable show a human check on Submit (hCaptcha, Cloudflare Turnstile), so they stop at the final page.
+auto_ats: [greenhouse]
+auto_min_score: 0
+ask_min_score: 0
+daily_cap: 300
+company_cooldown_days: 90

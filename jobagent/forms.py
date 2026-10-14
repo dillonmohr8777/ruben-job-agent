@@ -141,3 +141,52 @@ def plan_greenhouse(detail: dict, profile: dict) -> FormPlan:
         else:
             plan.left_blank.append(label[:80])
     return plan
+
+
+# --- Workable (jobs.workable.com): the public form endpoint lists every question before a browser opens ------------------------------------
+
+def fetch_workable_form(api_id: str, get) -> list:
+    return get(f"https://jobs.workable.com/api/v1/jobs/{api_id}/form?includeAccountMetadata=true&lng=en")
+
+
+WK_STANDARD = {"firstname": "first_name", "lastname": "last_name", "email": "email", "phone": "phone"}
+WK_SKIP = {"avatar", "summary", "resume", "cover_letter", "accountMetadata"}
+
+
+def plan_workable(form: list, profile: dict) -> FormPlan:
+    """Required questions we can answer from profile.answers are filled; anything else required (essays, salary, experience yes/no,
+    consents, dropdowns) is a blocker, so the job is queued with the rest of the form filled. Nothing is guessed."""
+    a = answers(profile)
+    loc = (a.get("location") or [""])
+    plan = FormPlan()
+    for sec in form:
+        for q in sec.get("fields", []):
+            qid, label, req, typ = q["id"], html_to_text(q.get("label", "")), bool(q.get("required")), q.get("type", "text")
+            if qid in WK_SKIP or typ == "file":
+                continue
+            if EEO.search(label):
+                plan.eeo_skipped += 1
+                continue
+            vals: list[str] = []
+            if qid in WK_STANDARD:
+                vals = a.get(WK_STANDARD[qid], [])
+            elif qid == "address":
+                vals = [f"{loc[0]}, United States of America"] if loc[0] else []
+            elif qid == "headline":
+                vals = a.get("current_title", [])
+            else:
+                key = next((k for rx, k in ANSWER_RULES if re.search(rx, label, re.I)), None)
+                vals = a.get(key or "", [])
+            if typ in ("boolean", "multiple"):
+                opts = [o["value"] for o in q.get("options", [])] or ["Yes", "No"]
+                pick = pick_option(vals, opts) if vals else None
+                if pick:
+                    plan.fills.append(Fill(qid, label, "choice", pick, req))
+                    continue
+            elif typ in ("dropdown", "date", "number"):
+                vals = []   # not supported by the adapter: left for a human if required
+            elif vals:
+                plan.fills.append(Fill(qid, label, "paragraph" if typ == "paragraph" else "text", vals[0], req))
+                continue
+            (plan.blockers if req else plan.left_blank).append(f"required: {label[:80]!r}" if req else label[:80])
+    return plan
