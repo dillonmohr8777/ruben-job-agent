@@ -28,3 +28,18 @@ def test_jev_score_minus_penalties_and_cached_drafts(profile, monkeypatch):
     assert llm("s", "u1") == "draft" and llm("s", "u1") == "fresh" and calls == ["u1"]   # a retry goes to the live writer
     big = make_job(description="x" * 20000)
     assert len(f"{volume.SYSTEM}\n\n{volume.prompt(volume.fits_brief(big, profile), profile)}".encode()) <= 15800
+
+
+def test_greenhouse_code_is_read_from_the_newest_matching_email(tmp_path, monkeypatch):
+    from jobagent import apply as ap
+    msg = {"messageTimestamp": "2026-10-14T00:55:30Z", "subject": "Security code for your application to Walker Sands",
+           "payload": "application:</p>\r\n<h1>Ab3dE6gH</h1>"}
+    f = tmp_path / "out.json"
+    f.write_text(json.dumps({"data": {"messages": [msg]}}))
+    monkeypatch.setattr(ap.shutil, "which", lambda _: "/bin/composio")
+    monkeypatch.setattr(ap.time, "sleep", lambda _: None)
+    monkeypatch.setattr(ap.subprocess, "run", lambda *a, **k: SimpleNamespace(stdout=json.dumps({"storedInFile": True, "outputFilePath": str(f)})))
+    since = ap.datetime.fromisoformat("2026-10-14T00:55:00+00:00").timestamp()
+    assert ap.email_code("Walker Sands", since, wait=10) == "Ab3dE6gH" and not f.exists()
+    f.write_text(json.dumps({"data": {"messages": [msg]}}))
+    assert ap.email_code("Found", since, wait=10) is None          # another company's code is never used
