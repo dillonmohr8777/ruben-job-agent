@@ -10,7 +10,10 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
+import subprocess
 import time
+from datetime import datetime
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
@@ -24,6 +27,34 @@ BB_API = "https://api.browserbase.com/v1"
 CONFIRM_TEXT = re.compile(r"thank you for applying|thanks for applying|application (has been )?(submitted|received)|we.ve received your application|application submitted", re.I)
 CONFIRM_URL = re.compile(r"confirmation|/thanks|submitted", re.I)
 ASHBY_SUBMIT_OP = "ApiSubmitSingleApplicationFormAction"   # the GraphQL mutation Ashby's own form sends on Submit
+
+
+CODE_SENT = re.compile(r"verification code was sent|enter the \d-character code|security code", re.I)
+
+
+def email_code(company: str, since: float, wait: int = 120) -> str | None:
+    """The newest Greenhouse security-code email for this company, read through the composio CLI (Gmail). Never logged."""
+    if not shutil.which("composio"):
+        return None
+    q = json.dumps({"query": "from:greenhouse-mail.io newer_than:1d", "max_results": 5, "include_payload": True, "verbose": True})
+    for _ in range(wait // 10):
+        time.sleep(10)
+        r = subprocess.run(["composio", "execute", "GMAIL_FETCH_EMAILS", "-d", q], capture_output=True, text=True, timeout=60)
+        try:
+            d = json.loads(r.stdout)
+            if d.get("storedInFile"):  # large replies are written to a temp file instead of stdout
+                f = Path(d["outputFilePath"])
+                d = json.loads(f.read_text())
+                f.unlink(missing_ok=True)   # it holds the code
+            msgs = (d.get("data") or d)["messages"]
+        except Exception:  # noqa: BLE001
+            continue
+        for m in msgs:
+            ts = datetime.fromisoformat(m.get("messageTimestamp", "1970-01-01T00:00:00Z").replace("Z", "+00:00")).timestamp()
+            if ts >= since - 60 and company.lower() in (m.get("subject") or "").lower():
+                if hit := re.search(r"<h1>\s*([A-Za-z0-9]{8})\s*</h1>", json.dumps(m)):
+                    return hit.group(1)
+    return None
 
 
 class ApplyError(RuntimeError):
@@ -439,14 +470,29 @@ def apply_job(page, job: Job, profile: dict, plan: FormPlan, cover_note: str, re
         page.wait_for_function("() => !/analyzing resume/i.test(document.body.innerText)", timeout=30000)
     except Exception:  # noqa: BLE001
         pass
-    page.get_by_role("button", name=re.compile(r"^\s*submit( application)?\s*$", re.I)).first.click()   # not Lever's hidden #hcaptchaSubmitBtn
+    submit_btn = page.get_by_role("button", name=re.compile(r"^\s*submit( application)?\s*$", re.I)).first   # not Lever's hidden #hcaptchaSubmitBtn
+    sent_at = time.time()
+    submit_btn.click()
     try:
         page.wait_for_function(
-            "([t,u]) => new RegExp(t,'i').test(document.body.innerText) || new RegExp(u,'i').test(location.href)",
-            arg=[CONFIRM_TEXT.pattern, CONFIRM_URL.pattern], timeout=25000)
+            "([t,u,c]) => new RegExp(t,'i').test(document.body.innerText) || new RegExp(u,'i').test(location.href) || new RegExp(c,'i').test(document.body.innerText)",
+            arg=[CONFIRM_TEXT.pattern, CONFIRM_URL.pattern, CODE_SENT.pattern], timeout=25000)
+        if CODE_SENT.search(page.inner_text("body")) and not CONFIRM_TEXT.search(page.inner_text("body")):
+            code = email_code(job.company, sent_at)   # Greenhouse emails the applicant an 8-character code; it proves the address, it is not a captcha
+            if not code:
+                raise ApplyError("security code email not found")
+            page.locator("input[id^=security-input], input[name*=security]").first.click()
+            page.keyboard.type(code)
+            submit_btn.click()
+            page.wait_for_function("([t,u]) => new RegExp(t,'i').test(document.body.innerText) || new RegExp(u,'i').test(location.href)",
+                                   arg=[CONFIRM_TEXT.pattern, CONFIRM_URL.pattern], timeout=25000)
         out.status = "VERIFIED"  # the employer's own confirmation page, not our click, is the proof
-    except Exception:  # noqa: BLE001
-        captcha = re.search(r"complete the recaptcha|captcha", page.inner_text("body"), re.I) or page.evaluate(JS_CAPTCHA_SHOWN)
+    except Exception as e:  # noqa: BLE001
+        captcha = re.search(r"complete the recaptcha", page.inner_text("body"), re.I) or page.evaluate(JS_CAPTCHA_SHOWN)
+        if not captcha and isinstance(e, ApplyError):
+            out.status, out.note = "FAILED", str(e)
+            out.shots.append(_shot(page, shots, f"{job.id}-after"))
+            return out
         out.status, out.note = ("BLOCKED", "NOT SUBMITTED: the form asked for a captcha; nothing was sent") if captcha else ("FAILED", "no confirmation page after submit")
     out.shots.append(_shot(page, shots, f"{job.id}-after"))
     return out
