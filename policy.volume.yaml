@@ -1,5 +1,5 @@
-# Volume mode (`python -m jobagent volume`). Same gate as policy.yaml, wider ATS list and a higher daily cap.
-auto_ats: [greenhouse, lever, ashby]   # Workable, Workday, iCIMS, freelance boards and the rest become packets for review
+# Volume mode (`python -m jobagent volume`). Same gate as policy.yaml, a lower Jev-based bar and a higher daily cap.
+auto_ats: [greenhouse]   # Ashby and Lever show a human check (hCaptcha) to automated browsers on every submit we tried: those become packets for a human
 auto_min_score: 70                     # Jev fit minus the deterministic penalties
 ask_min_score: 60
 daily_cap: 300                         # attempts per day, failed tries included
